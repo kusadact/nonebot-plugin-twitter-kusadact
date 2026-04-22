@@ -306,20 +306,17 @@ async def get_pic(url: str) -> MessageSegment:
 
 
 
-async def is_firefox_installed():
-    '''chekc firefox install | 检测Firefox是否已经安装 '''
+async def is_chromium_installed():
+    '''check chromium install | 检测Chromium是否已经安装'''
     try:
         playwright_manager = async_playwright()
         playwright = await playwright_manager.start()
-        browser = await playwright.firefox.launch(slow_mo=50)
+        browser = await playwright.chromium.launch(slow_mo=50)
         await browser.close()
+        await playwright.stop()
         return True
-    except Exception as e:
+    except Exception:
         return False
-
-# 安装Firefox
-def install_firefox():
-    os.system('playwright install firefox')
     
     
 # 发送

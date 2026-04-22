@@ -93,11 +93,8 @@ for url in website_list:
 get_driver = get_driver()
 @get_driver.on_startup
 async def pywt_init():
-    if plugin_config.twitter_htmlmode:
-        if not await is_firefox_installed():
-            logger.info("Firefox browser is not installed, installing...")
-            install_firefox()
-            logger.info("Firefox browser has been successfully installed.")
+    if plugin_config.twitter_htmlmode and not await is_chromium_installed():
+        logger.warning("Chromium browser is not installed for Playwright")
         
 async def create_browser():
     playwright_manager = async_playwright()
@@ -105,7 +102,7 @@ async def create_browser():
     launch_kwargs = {"slow_mo": 50}
     if plugin_config.twitter_proxy:
         launch_kwargs["proxy"] = {"server": plugin_config.twitter_proxy}
-    browser = await playwright.firefox.launch(**launch_kwargs)
+    browser = await playwright.chromium.launch(**launch_kwargs)
     return playwright,browser
         
 
