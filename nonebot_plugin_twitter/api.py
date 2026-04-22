@@ -12,7 +12,17 @@ from nonebot import logger
 from nonebot.adapters.onebot.v11 import MessageSegment,Message
 from playwright.async_api import async_playwright,Browser
 from nonebot_plugin_sendmsg_by_bots import tools
-from .config import Config, get_plugin_config, plugin_config, twitter_post, twitter_login, nitter_head,nitter_foot, SetCookieParam
+from .config import (
+    Config,
+    SetCookieParam,
+    get_browser_launch_kwargs,
+    get_plugin_config,
+    plugin_config,
+    twitter_login,
+    twitter_post,
+    nitter_foot,
+    nitter_head,
+)
 
 # Path
 dirpath = Path() / "data" / "twitter"
@@ -321,7 +331,7 @@ async def is_chromium_installed():
     try:
         playwright_manager = async_playwright()
         playwright = await playwright_manager.start()
-        browser = await playwright.chromium.launch(slow_mo=50)
+        browser = await playwright.chromium.launch(**get_browser_launch_kwargs())
         await browser.close()
         await playwright.stop()
         return True

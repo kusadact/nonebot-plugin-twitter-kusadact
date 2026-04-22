@@ -1,7 +1,7 @@
 from pydantic import BaseModel
 from typing import Literal, Optional
 from typing_extensions import TypedDict
-from nonebot import get_plugin_config
+from nonebot import get_driver, get_plugin_config
 
 
 class Config(BaseModel):
@@ -23,12 +23,41 @@ class Config(BaseModel):
     twitter_htmlmode: bool = False
     # 截取源地址网页
     twitter_original: bool = False
+    # Playwright 浏览器通道
+    twitter_browser_channel: Optional[str] = None
+    # Playwright 浏览器可执行文件路径
+    twitter_browser_executable_path: Optional[str] = None
     # 媒体无文字
     twitter_no_text: bool = False
     # 使用转发消息
     twitter_node: bool = True
            
 plugin_config = get_plugin_config(Config)
+global_config = get_driver().config
+
+
+def get_browser_launch_kwargs() -> dict:
+    launch_kwargs = {"slow_mo": 50}
+
+    if plugin_config.twitter_proxy:
+        launch_kwargs["proxy"] = {"server": plugin_config.twitter_proxy}
+
+    executable_path = (
+        plugin_config.twitter_browser_executable_path
+        or getattr(global_config, "htmlrender_browser_executable_path", None)
+    )
+    if executable_path:
+        launch_kwargs["executable_path"] = executable_path
+        return launch_kwargs
+
+    channel = (
+        plugin_config.twitter_browser_channel
+        or getattr(global_config, "htmlrender_browser_channel", None)
+    )
+    if channel:
+        launch_kwargs["channel"] = channel
+
+    return launch_kwargs
 
 website_list = [
     "https://nitter.net", # 403

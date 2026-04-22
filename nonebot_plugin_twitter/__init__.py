@@ -17,7 +17,13 @@ import random
 from httpx import AsyncClient,Client
 import asyncio
 from playwright.async_api import async_playwright
-from .config import Config, get_plugin_config, plugin_config,website_list
+from .config import (
+    Config,
+    get_browser_launch_kwargs,
+    get_plugin_config,
+    plugin_config,
+    website_list,
+)
 from .api import *
 
 
@@ -99,9 +105,7 @@ async def pywt_init():
 async def create_browser():
     playwright_manager = async_playwright()
     playwright = await playwright_manager.start()
-    launch_kwargs = {"slow_mo": 50}
-    if plugin_config.twitter_proxy:
-        launch_kwargs["proxy"] = {"server": plugin_config.twitter_proxy}
+    launch_kwargs = get_browser_launch_kwargs()
     browser = await playwright.chromium.launch(**launch_kwargs)
     return playwright,browser
         
