@@ -114,30 +114,36 @@ async def get_timeline_screen(browser: Browser,user_name: str,length: int = 5):
     url=f"{plugin_config.twitter_url}/{user_name}"
     context = await browser.new_context()
     page = await context.new_page()
-    await page.goto(url,timeout=60000)
-    await page.wait_for_load_state("networkidle")
-    await page.wait_for_selector('.timeline-item')
+    try:
+        await page.goto(url,timeout=60000)
+        await page.wait_for_load_state("networkidle")
+        await page.wait_for_selector('.timeline-item')
 
-    tweets = await page.query_selector_all('.timeline-item')
-    first_five_tweets = tweets[:5]
+        tweets = await page.query_selector_all('.timeline-item')
+        if not tweets:
+            return None
 
-    if len(first_five_tweets) > 0:
-        first_bbox = await first_five_tweets[0].bounding_box()
-        fifth_bbox = await first_five_tweets[4].bounding_box()
-        if first_bbox and fifth_bbox:
-            # 计算前五个推文所占的总高度
-            total_height = fifth_bbox['y'] + fifth_bbox['height'] - first_bbox['y']
-            # 截图
-            screen = await page.screenshot(
+        visible_count = min(max(length, 1), 5, len(tweets))
+        visible_tweets = tweets[:visible_count]
+
+        first_bbox = await visible_tweets[0].bounding_box()
+        last_bbox = await visible_tweets[-1].bounding_box()
+        if first_bbox and last_bbox:
+            # 计算截图区域高度，兼容不足 5 条推文的时间线
+            total_height = last_bbox['y'] + last_bbox['height'] - first_bbox['y']
+            return await page.screenshot(
                 full_page=True,
                 clip={
-                'x': first_bbox['x'],
-                'y': first_bbox['y'],
-                'width': first_bbox['width'],
-                'height': total_height,
-            })
-            return screen
-    return None
+                    'x': first_bbox['x'],
+                    'y': first_bbox['y'],
+                    'width': first_bbox['width'],
+                    'height': total_height,
+                },
+            )
+        return None
+    finally:
+        await page.close()
+        await context.close()
     
 async def get_tweet(browser: Browser,user_name:str,tweet_id: str = "0") -> dict:
     '''通过 user_name 和 tweet_id 获取推文详情,
@@ -227,7 +233,7 @@ async def get_tweet(browser: Browser,user_name:str,tweet_id: str = "0") -> dict:
         raise e
 
 
-async def get_video_path(url: str) -> str:
+async def get_video_path(url: str) -> list:
     try:
         async with httpx.AsyncClient(proxies=plugin_config.twitter_proxy) as client:
             res = await client.get(f"https://twitterxz.com/parse?url={url}",headers=header,timeout=120)
@@ -236,41 +242,46 @@ async def get_video_path(url: str) -> str:
             
             soup = BeautifulSoup(res.text, 'html.parser')
             hidden_div = soup.find('div', id='S:1')
-            if not hidden_div: return []
+            if not hidden_div:
+                return []
+
+            video_urls = []
             video_tag = hidden_div.find('video')
             if video_tag and video_tag.get('src'):
                 video_urls = [video_tag['src']]
 
-            if video_urls:
-                download_files = []
-                for url in video_urls:
-                    filename = str(int(datetime.now().timestamp())) + ".mp4"
-                    path = Path() / "data" / "twitter" / "cache" /  filename
-                    path = f"{os.getcwd()}/{str(path)}"
-                    async with client.stream("GET", url) as response:
-                        if res.status_code != 200:
-                            logger.warning(f"下载视频失败: {url}")
-                            continue
-                        with open(path, 'wb') as f:
-                            async for chunk in response.aiter_bytes():
-                                f.write(chunk)
-                    download_files.append(path)
-                return download_files
+            if not video_urls:
+                return []
+
+            download_files = []
+            for video_url in video_urls:
+                filename = str(int(datetime.now().timestamp())) + ".mp4"
+                path = Path() / "data" / "twitter" / "cache" /  filename
+                path = f"{os.getcwd()}/{str(path)}"
+                async with client.stream("GET", video_url) as response:
+                    if response.status_code != 200:
+                        logger.warning(f"下载视频失败: {video_url}")
+                        continue
+                    with open(path, 'wb') as f:
+                        async for chunk in response.aiter_bytes():
+                            f.write(chunk)
+                download_files.append(path)
+            return download_files
 
     except Exception as e:
         logger.warning(f"下载视频异常：url {url}，{e}")
         raise e
 
-async def get_video(file: str) -> MessageSegment:
+async def get_video(file_path: str) -> MessageSegment:
     '修改为返回视频消息，而非合并视频消息'
     # return MessageSegment.node_custom(user_id=user_id, nickname=name,
     #                                       content=Message(MessageSegment.video(f"file:///{task}"))) 
     try:
         # return MessageSegment.video(path)
-        return MessageSegment.video(f"file:///{file}")
+        return MessageSegment.video(f"file:///{file_path}")
     except Exception as e:
-        logger.debug(f"缓存视频异常：url {url}，{e}，转为返回原链接")
-        return MessageSegment.text(f"获取视频出错啦，原链接：{url}")
+        logger.debug(f"缓存视频异常：file {file_path}，{e}")
+        return MessageSegment.text("获取视频出错啦")
         
 async def get_pic(url: str) -> MessageSegment:
     '修改为返回图片消息，而非合并图片消息'
@@ -437,6 +448,7 @@ async def tweet_handle(tweet_info: dict,user_name: str,line_new_tweet_id: str,tw
     else:
         # 有没有截图不知道，内容信息是真有
         all_msg = await get_tweet_context(tweet_info,user_name,line_new_tweet_id)
+        has_text = bool(tweet_info["text"]) and not plugin_config.twitter_no_text
             
         # 准备发送消息
         if plugin_config.twitter_node:
@@ -450,7 +462,7 @@ async def tweet_handle(tweet_info: dict,user_name: str,line_new_tweet_id: str,tw
                         content=Message(value)
                     )
                 )
-            if not plugin_config.twitter_no_text:
+            if has_text:
                 # 开启了媒体文字
                 for x in tweet_info["text"]:
                     msg.append(MessageSegment.node_custom(
@@ -459,11 +471,14 @@ async def tweet_handle(tweet_info: dict,user_name: str,line_new_tweet_id: str,tw
                         content=
                         Message(x)
                     ))
-            # 发送合并消息    
-            await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(msg))
+            if msg:
+                # 发送合并消息
+                await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(msg))
+            else:
+                logger.info(f"推文 {user_name}/status/{line_new_tweet_id} 根据配置过滤后无可发送内容")
         else:
             # 以直接发送的方式
-            if all_msg[-1].type == "video":
+            if all_msg and all_msg[-1].type == "video":
                 # 有视频先发视频
                 video_msg = all_msg.pop()
                 # msg = []
@@ -476,11 +491,14 @@ async def tweet_handle(tweet_info: dict,user_name: str,line_new_tweet_id: str,tw
                 # )
                 # await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(msg),"video")
                 await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(video_msg),"video")
-            if not plugin_config.twitter_no_text:    
+            if has_text:
                 # 开启了媒体文字
                 all_msg.append(MessageSegment.text('\n\n'.join(tweet_info["text"])))
-            # 剩余部分直接发送
-            await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(all_msg),"direct")
+            if all_msg:
+                # 剩余部分直接发送
+                await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(all_msg),"direct")
+            else:
+                logger.info(f"推文 {user_name}/status/{line_new_tweet_id} 根据配置过滤后无可发送内容")
             
             
         # 更新本地缓存
@@ -520,6 +538,7 @@ async def tweet_handle_link(tweet_info: dict,user_name: str,line_new_tweet_id: s
     else:
         # 有没有截图不知道，内容信息是真有
         all_msg = await get_tweet_context(tweet_info,user_name,line_new_tweet_id)
+        has_text = bool(tweet_info["text"]) and not plugin_config.twitter_no_text
             
         # 准备发送消息
         if plugin_config.twitter_node:
@@ -533,7 +552,7 @@ async def tweet_handle_link(tweet_info: dict,user_name: str,line_new_tweet_id: s
                         content=Message(value)
                     )
                 )
-            if not plugin_config.twitter_no_text:
+            if has_text:
                 # 开启了媒体文字
                 for x in tweet_info["text"]:
                     msg.append(MessageSegment.node_custom(
@@ -542,18 +561,16 @@ async def tweet_handle_link(tweet_info: dict,user_name: str,line_new_tweet_id: s
                         content=
                         Message(x)
                     ))
-            # 发送合并消息    
-            # await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(msg))
-            return Message(msg)
+            return Message(msg) if msg else Message("")
         else:
             # 以直接发送的方式
-            if all_msg[-1].type == "video":
+            if all_msg and all_msg[-1].type == "video":
                 # 有视频先发视频
                 video_msg = all_msg.pop()
                 # await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(video_msg),"video")
-            if not plugin_config.twitter_no_text:    
+            if has_text:
                 # 开启了媒体文字
                 all_msg.append(MessageSegment.text('\n\n'.join(tweet_info["text"])))
             # 剩余部分直接发送
             # await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(all_msg),"direct")
-            return Message(all_msg)
+            return Message(all_msg) if all_msg else Message("")

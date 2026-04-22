@@ -48,10 +48,47 @@ __plugin_meta__ = PluginMetadata(
 )
 
 web_list = []
+
+
+def normalize_website_url(url: str) -> str:
+    return url.rstrip("/")
+
+
+def is_valid_website_response(content: str) -> bool:
+    markers = (
+        "profile-card-fullname",
+        "timeline-item",
+        "tweet-link",
+        "main-thread",
+        "tweet-content media-body",
+    )
+    return any(marker in content for marker in markers)
+
+
+def pick_website(client: Client) -> str:
+    probe_paths = ("/elonmusk", "/jack/status/20")
+    for raw_url in web_list:
+        url = normalize_website_url(raw_url)
+        for path in probe_paths:
+            full_url = f"{url}{path}"
+            try:
+                res = client.get(full_url, timeout=60)
+                if res.status_code == 200 and is_valid_website_response(res.text):
+                    logger.info(f"website: {url} ok! ({path})")
+                    return url
+            except Exception as e:
+                logger.debug(f"website选择异常：{e}")
+        logger.info(f"website: {url} failed!")
+    return ""
+
+
 if plugin_config.twitter_website:
     logger.info("使用自定义 website")
-    web_list.append(plugin_config.twitter_website)
-web_list += website_list
+    web_list.append(normalize_website_url(plugin_config.twitter_website))
+for url in website_list:
+    normalized_url = normalize_website_url(url)
+    if normalized_url not in web_list:
+        web_list.append(normalized_url)
 
 get_driver = get_driver()
 @get_driver.on_startup
@@ -65,24 +102,20 @@ async def pywt_init():
 async def create_browser():
     playwright_manager = async_playwright()
     playwright = await playwright_manager.start()
-    browser = await playwright.firefox.launch(slow_mo=50,proxy={"server": plugin_config.twitter_proxy})
+    launch_kwargs = {"slow_mo": 50}
+    if plugin_config.twitter_proxy:
+        launch_kwargs["proxy"] = {"server": plugin_config.twitter_proxy}
+    browser = await playwright.firefox.launch(**launch_kwargs)
     return playwright,browser
         
 
 with Client(proxies=plugin_config.twitter_proxy,http2=True) as client:
-    for url in web_list:
-        try:
-            full_url = f"{url}/elonmusk/status/1741087997410660402"
-            res = client.get(full_url, timeout=60)  # 添加超时
-            if res.status_code == 200:
-                logger.info(f"website: {url} ok!")
-                plugin_config.twitter_url = url
-                break
-            else:
-                logger.info(f"website: {url} failed!")
-        except Exception as e:
-            logger.debug(f"website选择异常：{e}")
-            continue
+    plugin_config.twitter_url = pick_website(client)
+
+if plugin_config.twitter_url:
+    logger.info(f"当前使用推文站点：{plugin_config.twitter_url}")
+else:
+    logger.warning("未找到可用的推文站点，请检查自定义 website 或代理配置")
         
 # 清理垃圾
 @scheduler.scheduled_job("cron",hour="5")

@@ -1,9 +1,7 @@
-from pydantic import BaseModel, root_validator,validator
+from pydantic import BaseModel
 from typing import Literal, Optional
 from typing_extensions import TypedDict
-from nonebot.log import logger
-from nonebot import get_driver, get_plugin_config
-import sys
+from nonebot import get_plugin_config
 
 
 class Config(BaseModel):
@@ -12,7 +10,7 @@ class Config(BaseModel):
     # 代理
     twitter_proxy: Optional[str] = None
     # 内部当前使用url
-    twitter_url: Optional[str] = "https://x.com/"
+    twitter_url: Optional[str] = ""
     # 内部当前使用url
     twitter_img_url: Optional[str] = "https://pbs.twimg.com/media/"
     # 自定义转发消息来源qq
