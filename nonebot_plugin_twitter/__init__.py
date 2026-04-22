@@ -106,7 +106,7 @@ async def create_browser():
     return playwright,browser
         
 
-with Client(proxies=plugin_config.twitter_proxy,http2=True) as client:
+with Client(**build_httpx_client_kwargs(http2=True)) as client:
     plugin_config.twitter_url = pick_website(client)
 
 if plugin_config.twitter_url:

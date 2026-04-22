@@ -42,6 +42,17 @@ header = {
         "Cache-Control": "no-cache",
     }
 
+
+def build_httpx_client_kwargs(*, http2: bool = False, timeout: Optional[float] = None) -> dict:
+    kwargs = {}
+    if plugin_config.twitter_proxy:
+        kwargs["proxy"] = plugin_config.twitter_proxy
+    if http2:
+        kwargs["http2"] = True
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+    return kwargs
+
 async def get_user_info(user_name:str) -> dict:
     '''通过 user_name 获取信息详情,
     return:
@@ -53,7 +64,7 @@ async def get_user_info(user_name:str) -> dict:
     result ={}
     result["status"] = False
     try:
-        async with httpx.AsyncClient(proxies=plugin_config.twitter_proxy,http2=True,timeout=120) as client:
+        async with httpx.AsyncClient(**build_httpx_client_kwargs(http2=True, timeout=120)) as client:
             res = await client.get(url=f"{plugin_config.twitter_url}/{user_name}",headers=header)
             
             if res.status_code == 200:
@@ -71,7 +82,7 @@ async def get_user_info(user_name:str) -> dict:
     return result
 
 async def get_user_timeline(user_name:str,since_id: str = "0"):
-    async with httpx.AsyncClient(proxies=plugin_config.twitter_proxy,http2=True,timeout=120) as client:
+    async with httpx.AsyncClient(**build_httpx_client_kwargs(http2=True, timeout=120)) as client:
         res = await client.get(url=f"{plugin_config.twitter_url}/{user_name}",headers=header)
         if res.status_code ==200:
             soup = BeautifulSoup(res.text,"html.parser")
@@ -189,8 +200,7 @@ async def get_tweet(browser: Browser,user_name:str,tweet_id: str = "0") -> dict:
             await page.close()
             await context.close()
 
-
-        async with httpx.AsyncClient(proxies=plugin_config.twitter_proxy,http2=True,timeout=120) as client:
+        async with httpx.AsyncClient(**build_httpx_client_kwargs(http2=True, timeout=120)) as client:
             res = await client.get(url,cookies={"hlsPlayback": "on"},headers=header)
             if res.status_code ==200:
                 soup = BeautifulSoup(res.text,"html.parser")
@@ -235,7 +245,7 @@ async def get_tweet(browser: Browser,user_name:str,tweet_id: str = "0") -> dict:
 
 async def get_video_path(url: str) -> list:
     try:
-        async with httpx.AsyncClient(proxies=plugin_config.twitter_proxy) as client:
+        async with httpx.AsyncClient(**build_httpx_client_kwargs(timeout=120)) as client:
             res = await client.get(f"https://twitterxz.com/parse?url={url}",headers=header,timeout=120)
             if res.status_code != 200:
                 raise ValueError("视频下载失败")
@@ -287,7 +297,7 @@ async def get_pic(url: str) -> MessageSegment:
     '修改为返回图片消息，而非合并图片消息'
     # 修改图片链接 用pbs.twimg.com发原图
     url = url.replace("/pic/orig/media%2F", "").replace(".jpg", "?format=png&name=large")
-    async with httpx.AsyncClient(proxies=plugin_config.twitter_proxy,http2=True) as client:
+    async with httpx.AsyncClient(**build_httpx_client_kwargs(http2=True)) as client:
         try:
             res = await client.get(f"{plugin_config.twitter_img_url}{url}",headers=header,timeout=120)
             if res.status_code != 200:
