@@ -683,6 +683,20 @@ def split_video_messages(all_msg: list[MessageSegment]) -> tuple[list[MessageSeg
     return media_msgs, video_msgs
 
 
+def should_send_nitter_first(tweet_info: dict) -> bool:
+    return bool(tweet_info.get("is_retweet") or tweet_info.get("quote_text"))
+
+
+def split_nitter_preview_messages(
+    tweet_info: dict, media_msgs: list[MessageSegment]
+) -> tuple[list[MessageSegment], list[MessageSegment]]:
+    if plugin_config.twitter_htmlmode and tweet_info.get("html") and media_msgs:
+        first_msg = media_msgs[0]
+        if first_msg.type == "image":
+            return [first_msg], media_msgs[1:]
+    return [], media_msgs
+
+
 async def tweet_handle(tweet_info: dict,user_name: str,line_new_tweet_id: str,twitter_list: dict) -> bool:
     if not tweet_info["status"] and not tweet_info["html"]:
         # 啥都没获取到
@@ -719,11 +733,24 @@ async def tweet_handle(tweet_info: dict,user_name: str,line_new_tweet_id: str,tw
         all_msg = await get_tweet_context(tweet_info,user_name,line_new_tweet_id)
         has_text = bool(tweet_info["text"]) and not plugin_config.twitter_no_text
         media_msgs, video_msgs = split_video_messages(all_msg)
+        prefer_nitter_first = should_send_nitter_first(tweet_info)
+        nitter_msgs, content_media_msgs = split_nitter_preview_messages(tweet_info, media_msgs)
             
         # 准备发送消息
         if plugin_config.twitter_node and not video_msgs:
             # 以合并方式发送
             msg = []
+            ordered_media_msgs = media_msgs
+            if prefer_nitter_first:
+                ordered_media_msgs = [*nitter_msgs, *content_media_msgs]
+                for value in nitter_msgs:
+                    msg.append(
+                        MessageSegment.node_custom(
+                            user_id=plugin_config.twitter_qq,
+                            nickname=twitter_list[user_name]["screen_name"],
+                            content=Message(value)
+                        )
+                    )
             if has_text:
                 # 开启了媒体文字
                 for x in tweet_info["text"]:
@@ -733,7 +760,7 @@ async def tweet_handle(tweet_info: dict,user_name: str,line_new_tweet_id: str,tw
                         content=
                         Message(x)
                     ))
-            for value in  media_msgs:
+            for value in ordered_media_msgs[len(nitter_msgs):] if prefer_nitter_first else ordered_media_msgs:
                 msg.append(
                     MessageSegment.node_custom(
                         user_id=plugin_config.twitter_qq,
@@ -749,6 +776,8 @@ async def tweet_handle(tweet_info: dict,user_name: str,line_new_tweet_id: str,tw
         else:
             if video_msgs:
                 # 合并转发不稳定支持视频，视频推文改为拆开发送
+                if prefer_nitter_first and nitter_msgs:
+                    await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(nitter_msgs),"direct")
                 if has_text:
                     await send_msg(
                         twitter_list,
@@ -758,20 +787,38 @@ async def tweet_handle(tweet_info: dict,user_name: str,line_new_tweet_id: str,tw
                         Message(MessageSegment.text('\n\n'.join(tweet_info["text"]))),
                         "direct",
                     )
-                if media_msgs:
-                    await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(media_msgs),"direct")
+                media_to_send = content_media_msgs if prefer_nitter_first else media_msgs
+                if media_to_send:
+                    await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(media_to_send),"direct")
                 for video_msg in video_msgs:
                     await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(video_msg),"video")
             else:
                 # 以直接发送的方式
-                if has_text:
-                    # 开启了媒体文字
-                    media_msgs.insert(0, MessageSegment.text('\n\n'.join(tweet_info["text"])))
-                if media_msgs:
-                    # 剩余部分直接发送
-                    await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(media_msgs),"direct")
+                if prefer_nitter_first:
+                    if nitter_msgs:
+                        await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(nitter_msgs),"direct")
+                    if has_text:
+                        await send_msg(
+                            twitter_list,
+                            user_name,
+                            line_new_tweet_id,
+                            tweet_info,
+                            Message(MessageSegment.text('\n\n'.join(tweet_info["text"]))),
+                            "direct",
+                        )
+                    if content_media_msgs:
+                        await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(content_media_msgs),"direct")
+                    if not nitter_msgs and not has_text and not content_media_msgs:
+                        logger.info(f"推文 {user_name}/status/{line_new_tweet_id} 根据配置过滤后无可发送内容")
                 else:
-                    logger.info(f"推文 {user_name}/status/{line_new_tweet_id} 根据配置过滤后无可发送内容")
+                    if has_text:
+                        # 开启了媒体文字
+                        media_msgs.insert(0, MessageSegment.text('\n\n'.join(tweet_info["text"])))
+                    if media_msgs:
+                        # 剩余部分直接发送
+                        await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(media_msgs),"direct")
+                    else:
+                        logger.info(f"推文 {user_name}/status/{line_new_tweet_id} 根据配置过滤后无可发送内容")
             
             
         # 更新本地缓存
@@ -817,11 +864,22 @@ async def tweet_handle_link(tweet_info: dict,user_name: str,line_new_tweet_id: s
         all_msg = await get_tweet_context(tweet_info,user_name,line_new_tweet_id)
         has_text = bool(tweet_info["text"]) and not plugin_config.twitter_no_text
         media_msgs, video_msgs = split_video_messages(all_msg)
+        prefer_nitter_first = should_send_nitter_first(tweet_info)
+        nitter_msgs, content_media_msgs = split_nitter_preview_messages(tweet_info, media_msgs)
             
         # 准备发送消息
         if plugin_config.twitter_node and not video_msgs:
             # 以合并方式发送
             msg = []
+            if prefer_nitter_first:
+                for value in nitter_msgs:
+                    msg.append(
+                        MessageSegment.node_custom(
+                            user_id=plugin_config.twitter_qq,
+                            nickname=user_name,
+                            content=Message(value)
+                        )
+                    )
             if has_text:
                 # 开启了媒体文字
                 for x in tweet_info["text"]:
@@ -831,7 +889,8 @@ async def tweet_handle_link(tweet_info: dict,user_name: str,line_new_tweet_id: s
                         content=
                         Message(x)
                     ))
-            for value in  media_msgs:
+            media_to_append = content_media_msgs if prefer_nitter_first else media_msgs
+            for value in  media_to_append:
                 msg.append(
                     MessageSegment.node_custom(
                         user_id=plugin_config.twitter_qq,
@@ -842,8 +901,14 @@ async def tweet_handle_link(tweet_info: dict,user_name: str,line_new_tweet_id: s
             return Message(msg) if msg else Message("")
         else:
             direct_msg = []
-            if has_text:
-                direct_msg.append(MessageSegment.text('\n\n'.join(tweet_info["text"])))
-            direct_msg.extend(media_msgs)
+            if prefer_nitter_first:
+                direct_msg.extend(nitter_msgs)
+                if has_text:
+                    direct_msg.append(MessageSegment.text('\n\n'.join(tweet_info["text"])))
+                direct_msg.extend(content_media_msgs)
+            else:
+                if has_text:
+                    direct_msg.append(MessageSegment.text('\n\n'.join(tweet_info["text"])))
+                direct_msg.extend(media_msgs)
             direct_msg.extend(video_msgs)
             return Message(direct_msg) if direct_msg else Message("")

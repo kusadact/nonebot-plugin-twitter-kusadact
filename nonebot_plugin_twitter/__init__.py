@@ -178,6 +178,7 @@ async def get_status(user_name,twitter_list,browser:Browser) -> bool:
         for entry in new_entries:
             tweet_info = await get_tweet(browser, entry["source_user_name"], entry["tweet_id"])
             if entry["is_retweet"]:
+                tweet_info["is_retweet"] = True
                 retweet_text = f"@{user_name} 转帖了 @{entry['source_user_name']}"
                 tweet_info["text"] = [retweet_text, *tweet_info.get("text", [])]
             result = await tweet_handle(tweet_info, user_name, entry["tweet_id"], twitter_list) and result
