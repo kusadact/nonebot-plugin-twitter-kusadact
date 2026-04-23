@@ -7,7 +7,7 @@ import os
 from typing import Optional,Literal
 from pathlib import Path
 from datetime import datetime
-from urllib.parse import unquote
+from urllib.parse import unquote, urljoin
 from bs4 import BeautifulSoup
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import MessageSegment,Message
@@ -226,13 +226,15 @@ async def get_tweet(browser: Browser,user_name:str,tweet_id: str = "0") -> dict:
                         result["pic_url_list"] = [x.attrs["href"] for x in pic_list]
                     # video
                     if video_list := main_thread_div.find_all('video'): # type: ignore
-                        # result["video_url"] = video_list[0].attrs["data-url"]
-                        try:
-                            video_url = video_list[0].parent.parent.parent.parent.parent.contents[1].attrs["href"].replace("#m","")
-                        except Exception as e:
-                            logger.info(f"获取视频推文链接出错，转为获取自身链接，{e}")
-                            video_url = url.split(plugin_config.twitter_url)[1]
-                        result["video_url"] = f"https://x.com{video_url}"
+                        if video_url := video_list[0].attrs.get("data-url"):
+                            result["video_url"] = video_url
+                        else:
+                            try:
+                                video_url = video_list[0].parent.parent.parent.parent.parent.contents[1].attrs["href"].replace("#m","")
+                            except Exception as e:
+                                logger.info(f"获取视频推文链接出错，转为获取自身链接，{e}")
+                                video_url = url.split(plugin_config.twitter_url)[1]
+                            result["video_url"] = f"https://x.com{video_url}"
                     # text
                     if match := main_thread_div.find_all('div', class_='tweet-content media-body'): # type: ignore
                         for x in match:
@@ -256,7 +258,101 @@ async def get_tweet(browser: Browser,user_name:str,tweet_id: str = "0") -> dict:
 
 async def get_video_path(url: str) -> list:
     try:
+        async def download_playlist(client: httpx.AsyncClient, playlist_url: str) -> str:
+            res = await client.get(
+                playlist_url,
+                headers=header,
+                cookies={"hlsPlayback": "on"},
+                timeout=120,
+            )
+            if res.status_code != 200:
+                raise ValueError(f"播放列表下载失败: {playlist_url} ({res.status_code})")
+            return res.text
+
+        def normalize_video_url(raw_url: str) -> str:
+            if raw_url.startswith("/"):
+                return f"{plugin_config.twitter_url}{raw_url}"
+            return raw_url
+
+        def resolve_nitter_url(raw_url: str) -> str:
+            if raw_url.startswith("http://") or raw_url.startswith("https://"):
+                return raw_url
+            return urljoin(plugin_config.twitter_url.rstrip("/") + "/", raw_url.lstrip("/"))
+
+        def choose_best_variant(lines: list[str]) -> str:
+            best_variant = ""
+            best_area = -1
+            for index, line in enumerate(lines):
+                if not line.startswith("#EXT-X-STREAM-INF:") or index + 1 >= len(lines):
+                    continue
+                area = 0
+                if "RESOLUTION=" in line:
+                    resolution = line.split("RESOLUTION=", 1)[1].split(",", 1)[0]
+                    width, height = resolution.split("x", 1)
+                    area = int(width) * int(height)
+                if area >= best_area:
+                    best_area = area
+                    best_variant = lines[index + 1].strip()
+            return best_variant
+
+        def parse_media_playlist(lines: list[str]) -> tuple[str, list[str]]:
+            init_url = ""
+            segment_urls: list[str] = []
+            for line in lines:
+                if line.startswith('#EXT-X-MAP:URI="'):
+                    init_url = line.split('URI="', 1)[1].split('"', 1)[0]
+                elif line and not line.startswith("#"):
+                    segment_urls.append(line.strip())
+            return init_url, segment_urls
+
+        async def download_nitter_hls_video(client: httpx.AsyncClient, master_url: str) -> list[str]:
+            master_url = normalize_video_url(master_url)
+            master_text = await download_playlist(client, master_url)
+            master_lines = master_text.splitlines()
+
+            variant_path = choose_best_variant(master_lines)
+            variant_url = resolve_nitter_url(variant_path) if variant_path else master_url
+            playlist_text = await download_playlist(client, variant_url)
+            init_url, segment_urls = parse_media_playlist(playlist_text.splitlines())
+            if not init_url or not segment_urls:
+                raise ValueError("未找到可下载的视频分片")
+
+            filename = f"{int(datetime.now().timestamp())}.mp4"
+            path = Path() / "data" / "twitter" / "cache" / filename
+            abs_path = f"{os.getcwd()}/{str(path)}"
+
+            with open(abs_path, "wb") as file:
+                init_res = await client.get(
+                    resolve_nitter_url(init_url),
+                    headers=header,
+                    cookies={"hlsPlayback": "on"},
+                    timeout=120,
+                )
+                if init_res.status_code != 200:
+                    raise ValueError(f"视频初始化片段下载失败: {init_res.status_code}")
+                file.write(init_res.content)
+
+                for segment_url in segment_urls:
+                    segment_res = await client.get(
+                        resolve_nitter_url(segment_url),
+                        headers=header,
+                        cookies={"hlsPlayback": "on"},
+                        timeout=120,
+                    )
+                    if segment_res.status_code != 200:
+                        raise ValueError(f"视频分片下载失败: {segment_res.status_code}")
+                    file.write(segment_res.content)
+
+            logger.info(f"通过 Nitter HLS 下载视频成功：{master_url}")
+            return [abs_path]
+
         async with httpx.AsyncClient(**build_httpx_client_kwargs(timeout=120)) as client:
+            if "/video/" in url:
+                try:
+                    return await download_nitter_hls_video(client, url)
+                except Exception as e:
+                    logger.warning(f"通过 Nitter HLS 下载视频异常：url {url}，{e}")
+
             res = await client.get(f"https://twitterxz.com/parse?url={url}",headers=header,timeout=120)
             if res.status_code != 200:
                 raise ValueError("视频下载失败")
