@@ -7,6 +7,7 @@ import os
 from typing import Optional,Literal
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import unquote
 from bs4 import BeautifulSoup
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import MessageSegment,Message
@@ -305,24 +306,49 @@ async def get_video(file_path: str) -> MessageSegment:
         
 async def get_pic(url: str) -> MessageSegment:
     '修改为返回图片消息，而非合并图片消息'
-    # 修改图片链接 用pbs.twimg.com发原图
-    url = url.replace("/pic/orig/media%2F", "").replace(".jpg", "?format=png&name=large")
+    def build_image_candidates(raw_url: str) -> list[str]:
+        candidates: list[str] = []
+        if raw_url.startswith("/"):
+            candidates.append(f"{plugin_config.twitter_url}{raw_url}")
+
+            decoded = unquote(raw_url)
+            if decoded.startswith("/pic/orig/media/"):
+                filename = decoded.removeprefix("/pic/orig/media/")
+                stem, ext = os.path.splitext(filename)
+                ext = ext.lstrip(".").lower()
+                if stem and ext:
+                    candidates.append(
+                        f"{plugin_config.twitter_img_url}{stem}?format={ext}&name=large"
+                    )
+        else:
+            candidates.append(raw_url)
+
+        deduped: list[str] = []
+        for candidate in candidates:
+            if candidate not in deduped:
+                deduped.append(candidate)
+        return deduped
+
+    candidates = build_image_candidates(url)
     async with httpx.AsyncClient(**build_httpx_client_kwargs(http2=True)) as client:
-        try:
-            res = await client.get(f"{plugin_config.twitter_img_url}{url}",headers=header,timeout=120)
-            if res.status_code != 200:
-                logger.warning(f"图片下载失败:{plugin_config.twitter_img_url}{url}，状态码：{res.status_code}")
-                # return MessageSegment.node_custom(user_id=plugin_config.twitter_qq, nickname=user_name,
-                #                        content=Message(f"图片加载失败 X_X {url}"))
-                return MessageSegment.text(f"图片加载失败 X_X 图片链接 {plugin_config.twitter_img_url}{url}")
-            tmp = bytes(random.randint(0,255))
-            # return MessageSegment.node_custom(user_id=plugin_config.twitter_qq, nickname=user_name,
-            #                            content=Message(MessageSegment.image(file=(res.read()+tmp))))
-            # print(f"图片下载成功：{plugin_config.twitter_img_url}{url}")
-            return MessageSegment.image(file=(res.read()+tmp))
-        except Exception as e:
-            logger.warning(f"获取图片出现异常 {plugin_config.twitter_img_url}{url} ：{e}")
-            return MessageSegment.text(f"图片加载失败 X_X 图片链接 {plugin_config.twitter_img_url}{url}")
+        last_error = ""
+        for candidate in candidates:
+            try:
+                res = await client.get(candidate, headers=header, timeout=120)
+                if res.status_code != 200:
+                    last_error = f"HTTP {res.status_code}"
+                    logger.warning(f"图片下载失败:{candidate}，状态码：{res.status_code}")
+                    continue
+                tmp = bytes(random.randint(0,255))
+                return MessageSegment.image(file=(res.read()+tmp))
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"获取图片出现异常 {candidate} ：{e}")
+
+        failed_url = candidates[0] if candidates else url
+        if last_error:
+            logger.warning(f"图片全部下载失败，最终错误：{last_error}")
+        return MessageSegment.text(f"图片加载失败 X_X 图片链接 {failed_url}")
 
 
 
