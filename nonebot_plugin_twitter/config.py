@@ -1,3 +1,5 @@
+import json
+
 from pydantic import BaseModel
 from typing import Literal, Optional
 from typing_extensions import TypedDict
@@ -23,6 +25,10 @@ class Config(BaseModel):
     twitter_htmlmode: bool = False
     # 截取源地址网页
     twitter_original: bool = False
+    # Nitter 截图时间显示时区
+    twitter_html_timezone: Optional[str] = "Asia/Shanghai"
+    # Nitter 截图时间显示标签
+    twitter_html_timezone_label: Optional[str] = "UTC+8"
     # Playwright 浏览器通道
     twitter_browser_channel: Optional[str] = None
     # Playwright 浏览器可执行文件路径
@@ -98,15 +104,73 @@ nitter_head = '''() => {
                 element.remove();
             }
         }'''
-        
-nitter_foot = '''() => {
+
+
+def build_nitter_foot_script() -> str:
+    timezone = plugin_config.twitter_html_timezone or ""
+    timezone_label = plugin_config.twitter_html_timezone_label or timezone
+    return f"""() => {{
             const elementXPath = '/html/body/div[1]/div/div[3]/div';
             const element = document.evaluate(elementXPath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-            
-            if (element) {
+
+            if (element) {{
                 element.remove();
-            }
-        }'''
+            }}
+
+            const timezone = {json.dumps(timezone)};
+            const timezoneLabel = {json.dumps(timezone_label)};
+            if (!timezone) {{
+                return;
+            }}
+
+            const parseUtcText = (value) => {{
+                if (!value || !/UTC/i.test(value)) {{
+                    return null;
+                }}
+
+                const normalized = value
+                    .replace(/\\s*·\\s*/g, " ")
+                    .replace(/\\s+/g, " ")
+                    .trim();
+                const parsed = new Date(normalized);
+                return Number.isNaN(parsed.getTime()) ? null : parsed;
+            }};
+
+            const formatTimestamp = (date) => {{
+                const datePart = new Intl.DateTimeFormat("en-US", {{
+                    timeZone: timezone,
+                    month: "short",
+                    day: "numeric",
+                    year: "numeric",
+                }}).format(date);
+                const timePart = new Intl.DateTimeFormat("en-US", {{
+                    timeZone: timezone,
+                    hour: "numeric",
+                    minute: "2-digit",
+                    hour12: true,
+                }}).format(date);
+                return `${{datePart}} · ${{timePart}} ${{timezoneLabel}}`;
+            }};
+
+            const patchTimestamp = (node) => {{
+                const textDate = parseUtcText(node.textContent?.trim() ?? "");
+                if (textDate) {{
+                    node.textContent = formatTimestamp(textDate);
+                }}
+
+                if (typeof node.getAttribute === "function" && typeof node.setAttribute === "function") {{
+                    const titleDate = parseUtcText(node.getAttribute("title") ?? "");
+                    if (titleDate) {{
+                        node.setAttribute("title", formatTimestamp(titleDate));
+                    }}
+                }}
+            }};
+
+            document.querySelectorAll(".tweet-published, .tweet-date a").forEach(patchTimestamp);
+        }}"""
+
+
+nitter_foot = build_nitter_foot_script()
         
 class SetCookieParam(TypedDict, total=False):
     name: str
