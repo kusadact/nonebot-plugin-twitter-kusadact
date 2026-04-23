@@ -4,6 +4,7 @@ import sys
 import typing
 import httpx
 import os
+import shutil
 from typing import Optional,Literal
 from pathlib import Path
 from datetime import datetime
@@ -394,8 +395,17 @@ async def get_video(file_path: str) -> MessageSegment:
     # return MessageSegment.node_custom(user_id=user_id, nickname=name,
     #                                       content=Message(MessageSegment.video(f"file:///{task}"))) 
     try:
-        # return MessageSegment.video(path)
-        return MessageSegment.video(f"file:///{file_path}")
+        send_path = file_path
+        host_path = plugin_config.twitter_video_send_host_path
+        container_path = plugin_config.twitter_video_send_container_path
+        if host_path and container_path:
+            filename = os.path.basename(file_path)
+            target_path = os.path.join(host_path, filename)
+            if os.path.abspath(file_path) != os.path.abspath(target_path):
+                Path(host_path).mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(file_path, target_path)
+            send_path = os.path.join(container_path, filename)
+        return MessageSegment.video(f"file://{send_path}")
     except Exception as e:
         logger.debug(f"缓存视频异常：file {file_path}，{e}")
         return MessageSegment.text("获取视频出错啦")
