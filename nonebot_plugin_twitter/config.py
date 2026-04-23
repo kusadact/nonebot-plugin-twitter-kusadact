@@ -31,6 +31,10 @@ class Config(BaseModel):
     twitter_video_send_host_path: Optional[str] = None
     # 可选：视频文件发送时在协议中使用的容器内路径
     twitter_video_send_container_path: Optional[str] = None
+    # 可选：远程视频转码接口
+    twitter_video_mux_api: Optional[str] = None
+    # 可选：远程视频转码接口鉴权 token
+    twitter_video_mux_token: Optional[str] = None
     # 媒体无文字
     twitter_no_text: bool = False
     # 使用转发消息

@@ -8,7 +8,7 @@ import shutil
 from typing import Optional,Literal
 from pathlib import Path
 from datetime import datetime
-from urllib.parse import unquote, urljoin
+from urllib.parse import quote, unquote, urljoin
 from bs4 import BeautifulSoup
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import MessageSegment,Message
@@ -259,6 +259,23 @@ async def get_tweet(browser: Browser,user_name:str,tweet_id: str = "0") -> dict:
 
 async def get_video_path(url: str) -> list:
     try:
+        async def download_video_file(client: httpx.AsyncClient, download_url: str, *, extra_headers: Optional[dict] = None) -> list[str]:
+            filename = f"{int(datetime.now().timestamp())}.mp4"
+            path = Path() / "data" / "twitter" / "cache" / filename
+            abs_path = f"{os.getcwd()}/{str(path)}"
+
+            headers_to_use = dict(header)
+            if extra_headers:
+                headers_to_use.update(extra_headers)
+
+            async with client.stream("GET", download_url, headers=headers_to_use, timeout=240) as response:
+                if response.status_code != 200:
+                    raise ValueError(f"视频下载失败: {download_url} ({response.status_code})")
+                with open(abs_path, "wb") as file:
+                    async for chunk in response.aiter_bytes():
+                        file.write(chunk)
+            return [abs_path]
+
         async def download_playlist(client: httpx.AsyncClient, playlist_url: str) -> str:
             res = await client.get(
                 playlist_url,
@@ -349,6 +366,17 @@ async def get_video_path(url: str) -> list:
 
         async with httpx.AsyncClient(**build_httpx_client_kwargs(timeout=120)) as client:
             if "/video/" in url:
+                if plugin_config.twitter_video_mux_api:
+                    mux_headers = {}
+                    if plugin_config.twitter_video_mux_token:
+                        mux_headers["X-Auth-Token"] = plugin_config.twitter_video_mux_token
+                    try:
+                        mux_url = f"{plugin_config.twitter_video_mux_api}?video_url={quote(url, safe='')}"
+                        files = await download_video_file(client, mux_url, extra_headers=mux_headers)
+                        logger.info(f"通过远程视频转码接口下载视频成功：{url}")
+                        return files
+                    except Exception as e:
+                        logger.warning(f"通过远程视频转码接口下载视频异常：url {url}，{e}")
                 try:
                     return await download_nitter_hls_video(client, url)
                 except Exception as e:
