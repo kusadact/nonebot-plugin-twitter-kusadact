@@ -12,7 +12,6 @@ from nonebot.exception import FinishedException
 from nonebot.plugin import PluginMetadata
 from pathlib import Path
 from importlib.metadata import version
-import json
 import random
 from httpx import AsyncClient,Client
 import asyncio
@@ -135,7 +134,7 @@ if plugin_config.plugin_enabled:
         @scheduler.scheduled_job("interval", minutes=3, id="twitter", misfire_grace_time=179)
         async def now_twitter():
             playwright, browser = await create_browser()
-            twitter_list = json.loads(dirpath.read_text("utf8"))
+            twitter_list = read_twitter_list()
             results = []
             try:
                 for user_name in twitter_list:
@@ -167,8 +166,12 @@ async def get_status(user_name,twitter_list,browser:Browser) -> bool:
             return True
 
         if not timeline_seen:
-            twitter_list[user_name]["timeline_seen"] = current_signatures
-            dirpath.write_text(json.dumps(twitter_list))
+            def init_timeline_seen(latest_twitter_list: dict):
+                if user_name not in latest_twitter_list:
+                    return
+                latest_twitter_list[user_name]["timeline_seen"] = current_signatures
+
+            update_twitter_list(init_timeline_seen)
             logger.info(f"初始化 {user_name} 的时间线游标")
             return True
 
@@ -183,8 +186,12 @@ async def get_status(user_name,twitter_list,browser:Browser) -> bool:
                 tweet_info["text"] = [retweet_text, *tweet_info.get("text", [])]
             result = await tweet_handle(tweet_info, user_name, entry["tweet_id"], twitter_list) and result
 
-        twitter_list[user_name]["timeline_seen"] = current_signatures
-        dirpath.write_text(json.dumps(twitter_list))
+        def persist_timeline_seen(latest_twitter_list: dict):
+            if user_name not in latest_twitter_list:
+                return
+            latest_twitter_list[user_name]["timeline_seen"] = current_signatures
+
+        update_twitter_list(persist_timeline_seen)
         return result
     except Exception as e:
         logger.debug(f"获取 {user_name} 的推文出现异常：{e}")
@@ -211,78 +218,58 @@ async def save_handle(bot:Bot,event: MessageEvent,matcher: Matcher,arg: Message 
     timeline_entries = await get_user_timeline_entries(data[0])
     timeline_seen = get_recent_timeline_signatures(timeline_entries)
     
-    twitter_list = json.loads(dirpath.read_text("utf8"))
-    if isinstance(event,GroupMessageEvent):
-        if data[0] not in twitter_list:
-            twitter_list[data[0]] = {
-                "group":{
-                    str(event.group_id):{
-                        "status":True,
-                        "r18":True if 'r18' in data[1:] else False,
-                        "media":True if '媒体' in data[1:] else False
-                    }
-                },
-                "private":{}
-            }
+    def save_subscription(latest_twitter_list: dict):
+        user_entry = ensure_twitter_user_entry(latest_twitter_list, data[0])
+        subscription = {
+            "status":True,
+            "r18":True if 'r18' in data[1:] else False,
+            "media":True if '媒体' in data[1:] else False
+        }
+        if isinstance(event,GroupMessageEvent):
+            user_entry["group"][str(event.group_id)] = subscription
         else:
-            twitter_list[data[0]]["group"][str(event.group_id)] = {
-                        "status":True,
-                        "r18":True if 'r18' in data[1:] else False,
-                        "media":True if '媒体' in data[1:] else False
-                    }
-    else:
-        if data[0] not in twitter_list:
-            twitter_list[data[0]] = {
-                "group":{},
-                "private":{
-                    str(event.user_id):{
-                        "status":True,
-                        "r18":True if 'r18' in data[1:] else False,
-                        "media":True if '媒体' in data[1:] else False
-                    }
-                }
-            }
-        else:
-            twitter_list[data[0]]["private"][str(event.user_id)] = {
-                        "status":True,
-                        "r18":True if 'r18' in data[1:] else False,
-                        "media":True if '媒体' in data[1:] else False
-                    }
-            
-    twitter_list[data[0]]["since_id"] = tweet_id
-    twitter_list[data[0]]["timeline_seen"] = timeline_seen
-    twitter_list[data[0]]["screen_name"] = user_info["screen_name"]
-    dirpath.write_text(json.dumps(twitter_list))
+            user_entry["private"][str(event.user_id)] = subscription
+
+        current_since_id = str(user_entry.get("since_id", "0"))
+        try:
+            user_entry["since_id"] = str(max(int(current_since_id), int(tweet_id)))
+        except Exception:
+            user_entry["since_id"] = tweet_id
+        user_entry["timeline_seen"] = timeline_seen
+        user_entry["screen_name"] = user_info["screen_name"]
+
+    update_twitter_list(save_subscription)
     await matcher.finish(f"id:{data[0]}\nname:{user_info['screen_name']}\n{user_info['bio']}\n订阅成功")
         
 
 delete = on_command("取关推主",block=True,priority=plugin_config.command_priority)
 @delete.handle()
 async def delete_handle(bot:Bot,event: MessageEvent,matcher: Matcher,arg: Message = CommandArg()):
-    twitter_list = json.loads(dirpath.read_text("utf8"))
-    if arg.extract_plain_text() not in twitter_list:
-        await matcher.finish(f"未找到 {arg}")
+    user_name = arg.extract_plain_text()
 
-    if isinstance(event,GroupMessageEvent):
-        if str(event.group_id) not in twitter_list[arg.extract_plain_text()]["group"]:
-            await matcher.finish(f"本群未订阅 {arg}")
-            
-        twitter_list[arg.extract_plain_text()]["group"].pop(str(event.group_id))
-        
-    else:
-        if str(event.user_id) not in twitter_list[arg.extract_plain_text()]["private"]:
-            await matcher.finish(f"未订阅 {arg}")
-            
-        twitter_list[arg.extract_plain_text()]["private"].pop(str(event.user_id))
-    pop_list = []
-    for user_name in twitter_list:
-        if twitter_list[user_name]["group"] == {} and twitter_list[user_name]["private"] == {}:
-            pop_list.append(user_name)
-            
-    for user_name in pop_list:
-        twitter_list.pop(user_name)
+    def delete_subscription(latest_twitter_list: dict):
+        if user_name not in latest_twitter_list:
+            return f"未找到 {arg}"
 
-    dirpath.write_text(json.dumps(twitter_list))
+        user_entry = ensure_twitter_user_entry(latest_twitter_list, user_name)
+        if isinstance(event,GroupMessageEvent):
+            group_id = str(event.group_id)
+            if group_id not in user_entry["group"]:
+                return f"本群未订阅 {arg}"
+            user_entry["group"].pop(group_id)
+        else:
+            private_id = str(event.user_id)
+            if private_id not in user_entry["private"]:
+                return f"未订阅 {arg}"
+            user_entry["private"].pop(private_id)
+
+        if user_entry["group"] == {} and user_entry["private"] == {}:
+            latest_twitter_list.pop(user_name, None)
+        return ""
+
+    error_message = update_twitter_list(delete_subscription)
+    if error_message:
+        await matcher.finish(error_message)
     
     await matcher.finish(f"取关 {arg.extract_plain_text()} 成功")
     
@@ -290,7 +277,7 @@ follow_list = on_command("推主列表",block=True,priority=plugin_config.comman
 @follow_list.handle()
 async def follow_list_handle(bot:Bot,event: MessageEvent,matcher: Matcher):
     
-    twitter_list = json.loads(dirpath.read_text("utf8"))
+    twitter_list = read_twitter_list()
     msg = []
     
     if isinstance(event,GroupMessageEvent):
@@ -330,27 +317,30 @@ async def is_rule(event:MessageEvent) -> bool:
 twitter_status = on_command("推文推送",block=True,rule=is_rule,priority=plugin_config.command_priority)
 @twitter_status.handle()
 async def twitter_status_handle(bot:Bot,event: MessageEvent,matcher: Matcher,arg: Message = CommandArg()):
-    twitter_list = json.loads(dirpath.read_text("utf8"))
     try:
-        if isinstance(event,GroupMessageEvent):
-            for user_name in twitter_list:
-                if str(event.group_id) in twitter_list[user_name]["group"]:
-                    if arg.extract_plain_text() == "开启":
-                        twitter_list[user_name]["group"][str(event.group_id)]["status"] = True
-                    elif arg.extract_plain_text() == "关闭":
-                        twitter_list[user_name]["group"][str(event.group_id)]["status"] = False
-                    else:
-                        await matcher.finish("错误指令")
+        desired_status = None
+        if arg.extract_plain_text() == "开启":
+            desired_status = True
+        elif arg.extract_plain_text() == "关闭":
+            desired_status = False
         else:
-            for user_name in twitter_list:
-                if str(event.user_id) in twitter_list[user_name]["private"]:
-                    if arg.extract_plain_text() == "开启":
-                        twitter_list[user_name]["private"][str(event.user_id)]["status"] = True
-                    elif arg.extract_plain_text() == "关闭":
-                        twitter_list[user_name]["private"][str(event.user_id)]["status"] = False
-                    else:
-                        await matcher.finish("错误指令")
-        dirpath.write_text(json.dumps(twitter_list))
+            await matcher.finish("错误指令")
+
+        def update_push_status(latest_twitter_list: dict):
+            if isinstance(event,GroupMessageEvent):
+                group_id = str(event.group_id)
+                for user_name in latest_twitter_list:
+                    user_entry = ensure_twitter_user_entry(latest_twitter_list, user_name)
+                    if group_id in user_entry["group"]:
+                        user_entry["group"][group_id]["status"] = desired_status
+            else:
+                private_id = str(event.user_id)
+                for user_name in latest_twitter_list:
+                    user_entry = ensure_twitter_user_entry(latest_twitter_list, user_name)
+                    if private_id in user_entry["private"]:
+                        user_entry["private"][private_id]["status"] = desired_status
+
+        update_twitter_list(update_push_status)
         await matcher.finish(f"推送已{arg.extract_plain_text()}")
     except FinishedException:
         pass
@@ -361,14 +351,17 @@ pat_twitter = on_regex(r'(twitter\.com|x\.com)/[a-zA-Z0-9_]+/status/\d+',priorit
 @pat_twitter.handle()
 async def pat_twitter_handle(bot: Bot,event: MessageEvent,matcher: Matcher,text: str = RegexStr()):
     logger.info(f"检测到推文链接 {text}")
-    link_list = json.loads(linkpath.read_text("utf8"))
+    link_list = read_link_list()
     playwright,browser = await create_browser()
     try:
         if isinstance(event,GroupMessageEvent):
             # 是群，处理一下先
             if str(event.group_id) not in link_list:
-                link_list[str(event.group_id)] = {"link":True}
-                linkpath.write_text(json.dumps(link_list))
+                def init_group_link_setting(latest_link_list: dict):
+                    latest_link_list.setdefault(str(event.group_id), {"link":True})
+
+                update_link_list(init_group_link_setting)
+                link_list = read_link_list()
             
             if not link_list[str(event.group_id)]["link"]:
                 # 关闭了链接识别
@@ -406,18 +399,19 @@ async def pat_twitter_handle(bot: Bot,event: MessageEvent,matcher: Matcher,text:
 twitter_link = on_command("推文链接识别",priority=plugin_config.command_priority)
 @twitter_link.handle()
 async def twitter_link_handle(event: GroupMessageEvent,matcher: Matcher,arg: Message = CommandArg()):
-    link_list = json.loads(linkpath.read_text("utf8"))
-    if str(event.group_id) not in link_list:
-        link_list[str(event.group_id)] = {"link":True}
-        linkpath.write_text(json.dumps(link_list))
     if "开启" in arg.extract_plain_text():
-        link_list[str(event.group_id)]["link"] = True
+        desired_status = True
     elif "关闭" in arg.extract_plain_text():
-        link_list[str(event.group_id)]["link"] = False
+        desired_status = False
     else:
         await matcher.finish("仅支持“开启”和“关闭”操作")
-    linkpath.write_text(json.dumps(link_list))    
-    await matcher.finish(f"推文链接识别已{arg.extract_plain_text()}")
+
+    def update_group_link_setting(latest_link_list: dict):
+        latest_link_list.setdefault(str(event.group_id), {"link":True})
+        latest_link_list[str(event.group_id)]["link"] = desired_status
+
+    update_link_list(update_group_link_setting)
+    await matcher.finish(f"推文链接识别已{arg.extract_plain_text()}")    
     
 twitter_timeline = on_command("推文列表",priority=plugin_config.command_priority)
 @twitter_timeline.handle()

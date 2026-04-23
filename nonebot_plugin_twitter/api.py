@@ -5,6 +5,7 @@ import typing
 import httpx
 import os
 import shutil
+from threading import RLock
 from typing import Optional,Literal
 from pathlib import Path
 from datetime import datetime
@@ -39,6 +40,9 @@ linkpath = Path() / "data" / "twitter" / "twitter_link.json"
 linkpath.touch()
 if not linkpath.stat().st_size:
     linkpath.write_text("{}")
+
+twitter_list_lock = RLock()
+link_list_lock = RLock()
     
 header = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
@@ -55,6 +59,61 @@ header = {
     }
 
 TIMELINE_SEEN_LIMIT = 50
+
+
+def _read_json_dict(path: Path) -> dict:
+    try:
+        raw = path.read_text("utf8").strip()
+        if not raw:
+            return {}
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return data
+        logger.warning(f"{path} 内容不是字典，已按空字典处理")
+    except json.JSONDecodeError as e:
+        logger.warning(f"读取 {path} 失败，JSON 损坏：{e}")
+    except FileNotFoundError:
+        return {}
+    return {}
+
+
+def _write_json_dict_atomic(path: Path, data: dict) -> None:
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{random.randint(0, 999999):06d}.tmp")
+    tmp_path.write_text(json.dumps(data, ensure_ascii=False), "utf8")
+    tmp_path.replace(path)
+
+
+def read_twitter_list() -> dict:
+    with twitter_list_lock:
+        return _read_json_dict(dirpath)
+
+
+def update_twitter_list(mutator):
+    with twitter_list_lock:
+        twitter_list = _read_json_dict(dirpath)
+        result = mutator(twitter_list)
+        _write_json_dict_atomic(dirpath, twitter_list)
+        return result
+
+
+def ensure_twitter_user_entry(twitter_list: dict, user_name: str) -> dict:
+    user_entry = twitter_list.setdefault(user_name, {})
+    user_entry.setdefault("group", {})
+    user_entry.setdefault("private", {})
+    return user_entry
+
+
+def read_link_list() -> dict:
+    with link_list_lock:
+        return _read_json_dict(linkpath)
+
+
+def update_link_list(mutator):
+    with link_list_lock:
+        link_list = _read_json_dict(linkpath)
+        result = mutator(link_list)
+        _write_json_dict_atomic(linkpath, link_list)
+        return result
 
 
 def build_httpx_client_kwargs(*, http2: bool = False, timeout: Optional[float] = None) -> dict:
@@ -822,12 +881,16 @@ async def tweet_handle(tweet_info: dict,user_name: str,line_new_tweet_id: str,tw
             
             
         # 更新本地缓存
-        current_since_id = str(twitter_list[user_name].get("since_id", "0"))
-        try:
-            twitter_list[user_name]["since_id"] = str(max(int(current_since_id), int(line_new_tweet_id)))
-        except Exception:
-            twitter_list[user_name]["since_id"] = current_since_id
-        dirpath.write_text(json.dumps(twitter_list))
+        def persist_since_id(latest_twitter_list: dict):
+            if user_name not in latest_twitter_list:
+                return
+            current_since_id = str(latest_twitter_list[user_name].get("since_id", "0"))
+            try:
+                latest_twitter_list[user_name]["since_id"] = str(max(int(current_since_id), int(line_new_tweet_id)))
+            except Exception:
+                latest_twitter_list[user_name]["since_id"] = current_since_id
+
+        update_twitter_list(persist_since_id)
         return True
     
     
