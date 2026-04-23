@@ -643,14 +643,6 @@ async def tweet_handle(tweet_info: dict,user_name: str,line_new_tweet_id: str,tw
         if plugin_config.twitter_node and not video_msgs:
             # 以合并方式发送
             msg = []
-            for value in  media_msgs:
-                msg.append(
-                    MessageSegment.node_custom(
-                        user_id=plugin_config.twitter_qq,
-                        nickname=twitter_list[user_name]["screen_name"],
-                        content=Message(value)
-                    )
-                )
             if has_text:
                 # 开启了媒体文字
                 for x in tweet_info["text"]:
@@ -660,6 +652,14 @@ async def tweet_handle(tweet_info: dict,user_name: str,line_new_tweet_id: str,tw
                         content=
                         Message(x)
                     ))
+            for value in  media_msgs:
+                msg.append(
+                    MessageSegment.node_custom(
+                        user_id=plugin_config.twitter_qq,
+                        nickname=twitter_list[user_name]["screen_name"],
+                        content=Message(value)
+                    )
+                )
             if msg:
                 # 发送合并消息
                 await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(msg))
@@ -668,10 +668,6 @@ async def tweet_handle(tweet_info: dict,user_name: str,line_new_tweet_id: str,tw
         else:
             if video_msgs:
                 # 合并转发不稳定支持视频，视频推文改为拆开发送
-                if media_msgs:
-                    await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(media_msgs),"direct")
-                for video_msg in video_msgs:
-                    await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(video_msg),"video")
                 if has_text:
                     await send_msg(
                         twitter_list,
@@ -681,11 +677,15 @@ async def tweet_handle(tweet_info: dict,user_name: str,line_new_tweet_id: str,tw
                         Message(MessageSegment.text('\n\n'.join(tweet_info["text"]))),
                         "direct",
                     )
+                if media_msgs:
+                    await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(media_msgs),"direct")
+                for video_msg in video_msgs:
+                    await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(video_msg),"video")
             else:
                 # 以直接发送的方式
                 if has_text:
                     # 开启了媒体文字
-                    media_msgs.append(MessageSegment.text('\n\n'.join(tweet_info["text"])))
+                    media_msgs.insert(0, MessageSegment.text('\n\n'.join(tweet_info["text"])))
                 if media_msgs:
                     # 剩余部分直接发送
                     await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(media_msgs),"direct")
@@ -737,14 +737,6 @@ async def tweet_handle_link(tweet_info: dict,user_name: str,line_new_tweet_id: s
         if plugin_config.twitter_node and not video_msgs:
             # 以合并方式发送
             msg = []
-            for value in  media_msgs:
-                msg.append(
-                    MessageSegment.node_custom(
-                        user_id=plugin_config.twitter_qq,
-                        nickname=user_name,
-                        content=Message(value)
-                    )
-                )
             if has_text:
                 # 开启了媒体文字
                 for x in tweet_info["text"]:
@@ -754,11 +746,19 @@ async def tweet_handle_link(tweet_info: dict,user_name: str,line_new_tweet_id: s
                         content=
                         Message(x)
                     ))
+            for value in  media_msgs:
+                msg.append(
+                    MessageSegment.node_custom(
+                        user_id=plugin_config.twitter_qq,
+                        nickname=user_name,
+                        content=Message(value)
+                    )
+                )
             return Message(msg) if msg else Message("")
         else:
             direct_msg = []
-            direct_msg.extend(media_msgs)
-            direct_msg.extend(video_msgs)
             if has_text:
                 direct_msg.append(MessageSegment.text('\n\n'.join(tweet_info["text"])))
+            direct_msg.extend(media_msgs)
+            direct_msg.extend(video_msgs)
             return Message(direct_msg) if direct_msg else Message("")
