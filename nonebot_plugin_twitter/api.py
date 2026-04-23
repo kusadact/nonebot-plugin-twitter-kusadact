@@ -553,6 +553,17 @@ async def get_tweet_context(tweet_info: dict,user_name: str,line_new_tweet_id: s
     return all_msg
 
 
+def split_video_messages(all_msg: list[MessageSegment]) -> tuple[list[MessageSegment], list[MessageSegment]]:
+    media_msgs: list[MessageSegment] = []
+    video_msgs: list[MessageSegment] = []
+    for msg in all_msg:
+        if msg.type == "video":
+            video_msgs.append(msg)
+        else:
+            media_msgs.append(msg)
+    return media_msgs, video_msgs
+
+
 async def tweet_handle(tweet_info: dict,user_name: str,line_new_tweet_id: str,twitter_list: dict) -> bool:
     if not tweet_info["status"] and not tweet_info["html"]:
         # 啥都没获取到
@@ -588,12 +599,13 @@ async def tweet_handle(tweet_info: dict,user_name: str,line_new_tweet_id: str,tw
         # 有没有截图不知道，内容信息是真有
         all_msg = await get_tweet_context(tweet_info,user_name,line_new_tweet_id)
         has_text = bool(tweet_info["text"]) and not plugin_config.twitter_no_text
+        media_msgs, video_msgs = split_video_messages(all_msg)
             
         # 准备发送消息
-        if plugin_config.twitter_node:
+        if plugin_config.twitter_node and not video_msgs:
             # 以合并方式发送
             msg = []
-            for value in  all_msg:
+            for value in  media_msgs:
                 msg.append(
                     MessageSegment.node_custom(
                         user_id=plugin_config.twitter_qq,
@@ -616,28 +628,31 @@ async def tweet_handle(tweet_info: dict,user_name: str,line_new_tweet_id: str,tw
             else:
                 logger.info(f"推文 {user_name}/status/{line_new_tweet_id} 根据配置过滤后无可发送内容")
         else:
-            # 以直接发送的方式
-            if all_msg and all_msg[-1].type == "video":
-                # 有视频先发视频
-                video_msg = all_msg.pop()
-                # msg = []
-                # msg.append(
-                #     MessageSegment.node_custom(
-                #         user_id=plugin_config.twitter_qq,
-                #         nickname=twitter_list[user_name]["screen_name"],
-                #         content=Message(video_msg)
-                #     )
-                # )
-                # await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(msg),"video")
-                await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(video_msg),"video")
-            if has_text:
-                # 开启了媒体文字
-                all_msg.append(MessageSegment.text('\n\n'.join(tweet_info["text"])))
-            if all_msg:
-                # 剩余部分直接发送
-                await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(all_msg),"direct")
+            if video_msgs:
+                # 合并转发不稳定支持视频，视频推文改为拆开发送
+                if media_msgs:
+                    await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(media_msgs),"direct")
+                for video_msg in video_msgs:
+                    await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(video_msg),"video")
+                if has_text:
+                    await send_msg(
+                        twitter_list,
+                        user_name,
+                        line_new_tweet_id,
+                        tweet_info,
+                        Message(MessageSegment.text('\n\n'.join(tweet_info["text"]))),
+                        "direct",
+                    )
             else:
-                logger.info(f"推文 {user_name}/status/{line_new_tweet_id} 根据配置过滤后无可发送内容")
+                # 以直接发送的方式
+                if has_text:
+                    # 开启了媒体文字
+                    media_msgs.append(MessageSegment.text('\n\n'.join(tweet_info["text"])))
+                if media_msgs:
+                    # 剩余部分直接发送
+                    await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(media_msgs),"direct")
+                else:
+                    logger.info(f"推文 {user_name}/status/{line_new_tweet_id} 根据配置过滤后无可发送内容")
             
             
         # 更新本地缓存
@@ -678,12 +693,13 @@ async def tweet_handle_link(tweet_info: dict,user_name: str,line_new_tweet_id: s
         # 有没有截图不知道，内容信息是真有
         all_msg = await get_tweet_context(tweet_info,user_name,line_new_tweet_id)
         has_text = bool(tweet_info["text"]) and not plugin_config.twitter_no_text
+        media_msgs, video_msgs = split_video_messages(all_msg)
             
         # 准备发送消息
-        if plugin_config.twitter_node:
+        if plugin_config.twitter_node and not video_msgs:
             # 以合并方式发送
             msg = []
-            for value in  all_msg:
+            for value in  media_msgs:
                 msg.append(
                     MessageSegment.node_custom(
                         user_id=plugin_config.twitter_qq,
@@ -702,14 +718,9 @@ async def tweet_handle_link(tweet_info: dict,user_name: str,line_new_tweet_id: s
                     ))
             return Message(msg) if msg else Message("")
         else:
-            # 以直接发送的方式
-            if all_msg and all_msg[-1].type == "video":
-                # 有视频先发视频
-                video_msg = all_msg.pop()
-                # await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(video_msg),"video")
+            direct_msg = []
+            direct_msg.extend(media_msgs)
+            direct_msg.extend(video_msgs)
             if has_text:
-                # 开启了媒体文字
-                all_msg.append(MessageSegment.text('\n\n'.join(tweet_info["text"])))
-            # 剩余部分直接发送
-            # await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(all_msg),"direct")
-            return Message(all_msg) if all_msg else Message("")
+                direct_msg.append(MessageSegment.text('\n\n'.join(tweet_info["text"])))
+            return Message(direct_msg) if direct_msg else Message("")

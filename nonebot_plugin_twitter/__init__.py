@@ -359,13 +359,17 @@ async def pat_twitter_handle(bot: Bot,event: MessageEvent,matcher: Matcher,text:
         
         tweet_info = await get_tweet(browser,user_name,tweet_id)
         msg = await tweet_handle_link(tweet_info,user_name,tweet_id)
-        if plugin_config.twitter_node:
+        if plugin_config.twitter_node and all(segment.type == "node" for segment in msg):
             if isinstance(event,GroupMessageEvent):
                 await bot.send_group_forward_msg(group_id=int(event.group_id), messages=msg)
             else:
                 await bot.send_private_forward_msg(user_id=int(event.user_id), messages=msg)
         else:
-            await matcher.send(msg, reply_message=True)
+            if any(segment.type == "video" for segment in msg):
+                for segment in msg:
+                    await matcher.send(segment, reply_message=True)
+            else:
+                await matcher.send(msg, reply_message=True)
     except FinishedException:
         pass            
     except Exception as e:
