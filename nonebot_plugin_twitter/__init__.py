@@ -159,12 +159,32 @@ if plugin_config.plugin_enabled:
 async def get_status(user_name,twitter_list,browser:Browser) -> bool:
     # 获取推文
     try:
-        line_new_tweet_id = await get_user_newtimeline(user_name,twitter_list[user_name]["since_id"])
-        if line_new_tweet_id and line_new_tweet_id != "not found":
-            # update tweet
-            tweet_info = await get_tweet(browser,user_name,line_new_tweet_id)
-            return await tweet_handle(tweet_info,user_name,line_new_tweet_id,twitter_list)
-        return True
+        timeline_entries = await get_user_timeline_entries(user_name)
+        timeline_seen = twitter_list[user_name].get("timeline_seen", [])
+        current_signatures = get_recent_timeline_signatures(timeline_entries)
+
+        if not current_signatures:
+            return True
+
+        if not timeline_seen:
+            twitter_list[user_name]["timeline_seen"] = current_signatures
+            dirpath.write_text(json.dumps(twitter_list))
+            logger.info(f"初始化 {user_name} 的时间线游标")
+            return True
+
+        new_entries = get_new_timeline_entries(timeline_entries, timeline_seen)
+        result = True
+
+        for entry in new_entries:
+            tweet_info = await get_tweet(browser, entry["source_user_name"], entry["tweet_id"])
+            if entry["is_retweet"]:
+                retweet_text = f"@{user_name} 转帖了 @{entry['source_user_name']}"
+                tweet_info["text"] = [retweet_text, *tweet_info.get("text", [])]
+            result = await tweet_handle(tweet_info, user_name, entry["tweet_id"], twitter_list) and result
+
+        twitter_list[user_name]["timeline_seen"] = current_signatures
+        dirpath.write_text(json.dumps(twitter_list))
+        return result
     except Exception as e:
         logger.debug(f"获取 {user_name} 的推文出现异常：{e}")
         return False
@@ -187,6 +207,8 @@ async def save_handle(bot:Bot,event: MessageEvent,matcher: Matcher,arg: Message 
         await matcher.finish(f"未找到 {data[0]}")
 
     tweet_id = await get_user_newtimeline(data[0])
+    timeline_entries = await get_user_timeline_entries(data[0])
+    timeline_seen = get_recent_timeline_signatures(timeline_entries)
     
     twitter_list = json.loads(dirpath.read_text("utf8"))
     if isinstance(event,GroupMessageEvent):
@@ -227,6 +249,7 @@ async def save_handle(bot:Bot,event: MessageEvent,matcher: Matcher,arg: Message 
                     }
             
     twitter_list[data[0]]["since_id"] = tweet_id
+    twitter_list[data[0]]["timeline_seen"] = timeline_seen
     twitter_list[data[0]]["screen_name"] = user_info["screen_name"]
     dirpath.write_text(json.dumps(twitter_list))
     await matcher.finish(f"id:{data[0]}\nname:{user_info['screen_name']}\n{user_info['bio']}\n订阅成功")

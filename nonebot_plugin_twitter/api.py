@@ -54,6 +54,8 @@ header = {
         "Cache-Control": "no-cache",
     }
 
+TIMELINE_SEEN_LIMIT = 50
+
 
 def build_httpx_client_kwargs(*, http2: bool = False, timeout: Optional[float] = None) -> dict:
     kwargs = {}
@@ -64,6 +66,68 @@ def build_httpx_client_kwargs(*, http2: bool = False, timeout: Optional[float] =
     if timeout is not None:
         kwargs["timeout"] = timeout
     return kwargs
+
+
+def normalize_tweet_href(href: str) -> str:
+    return href.split("#", 1)[0]
+
+
+def parse_timeline_entries(soup: BeautifulSoup, follow_user_name: str) -> list[dict]:
+    entries = []
+    for timeline_item in soup.find_all("div", class_="timeline-item"):
+        tweet_link = timeline_item.find("a", class_="tweet-link")
+        if not tweet_link or "href" not in tweet_link.attrs:
+            continue
+
+        href = normalize_tweet_href(str(tweet_link.attrs["href"]))
+        parts = href.strip("/").split("/")
+        if len(parts) < 3 or parts[1] != "status":
+            continue
+
+        source_user_name = parts[0]
+        tweet_id = parts[2]
+        is_retweet = timeline_item.find("div", class_="retweet-header") is not None
+        is_quote = timeline_item.find("div", class_="quote") is not None
+
+        if not is_retweet and source_user_name != follow_user_name:
+            continue
+
+        entries.append(
+            {
+                "follow_user_name": follow_user_name,
+                "source_user_name": source_user_name,
+                "tweet_id": tweet_id,
+                "href": href,
+                "signature": f"{'retweet' if is_retweet else 'tweet'}:{href}",
+                "is_retweet": is_retweet,
+                "is_quote": is_quote,
+            }
+        )
+
+    return entries
+
+
+def get_recent_timeline_signatures(entries: list[dict], limit: int = TIMELINE_SEEN_LIMIT) -> list[str]:
+    return [entry["signature"] for entry in entries[:limit]]
+
+
+def get_new_timeline_entries(entries: list[dict], seen_signatures: list[str]) -> list[dict]:
+    if not entries or not seen_signatures:
+        return []
+
+    current_signatures = {entry["signature"] for entry in entries}
+    if not current_signatures.intersection(seen_signatures):
+        return []
+
+    seen_signature_set = set(seen_signatures)
+    new_entries = []
+    for entry in entries:
+        if entry["signature"] in seen_signature_set:
+            break
+        new_entries.append(entry)
+
+    new_entries.reverse()
+    return new_entries
 
 async def get_user_info(user_name:str) -> dict:
     '''通过 user_name 获取信息详情,
@@ -93,27 +157,32 @@ async def get_user_info(user_name:str) -> dict:
 
     return result
 
-async def get_user_timeline(user_name:str,since_id: str = "0"):
+async def get_user_timeline_entries(user_name: str) -> list[dict]:
     async with httpx.AsyncClient(**build_httpx_client_kwargs(http2=True, timeout=120)) as client:
         res = await client.get(url=f"{plugin_config.twitter_url}/{user_name}",headers=header)
         if res.status_code ==200:
             soup = BeautifulSoup(res.text,"html.parser")
-            timeline_list = soup.find_all('a', class_='tweet-link')
-            new_line =[]
-            for x in timeline_list:
-                if user_name in x.attrs["href"]:
-                    tweet_id = x.attrs["href"].split("/").pop().replace("#m","")
-                    if since_id != "0":
-                        if int(tweet_id) > int(since_id):
-                            logger.trace(f"通过 user_name {user_name} 获取时间线成功：{tweet_id}")
-                            new_line.append(tweet_id)
-                    else:
-                        new_line.append(tweet_id)
-                        
+            return parse_timeline_entries(soup, user_name)
         else:
             logger.warning(f"通过 user_name {user_name} 获取时间线失败：{res.status_code} {res.text}")
-            new_line = ["not found"]
-        return new_line
+            return []
+
+
+async def get_user_timeline(user_name:str,since_id: str = "0"):
+    entries = await get_user_timeline_entries(user_name)
+    new_line = []
+    for entry in entries:
+        if entry["source_user_name"] != user_name:
+            continue
+
+        tweet_id = entry["tweet_id"]
+        if since_id != "0":
+            if int(tweet_id) > int(since_id):
+                logger.trace(f"通过 user_name {user_name} 获取时间线成功：{tweet_id}")
+                new_line.append(tweet_id)
+        else:
+            new_line.append(tweet_id)
+    return new_line
 
 async def get_user_newtimeline(user_name:str,since_id: str = "0") -> str:
     ''' 通过 user_name 获取推文id列表,
@@ -221,6 +290,8 @@ async def get_tweet(browser: Browser,user_name:str,tweet_id: str = "0") -> dict:
                 result["text"] = []
                 result["pic_url_list"] = []
                 result["video_url"] = ""
+                result["quote_text"] = ""
+                result["quote_user_name"] = ""
                 if main_thread_div := soup.find('div', class_='main-thread'):
                     # pic
                     if pic_list := main_thread_div.find_all('a', class_='still-image'): # type: ignore
@@ -242,6 +313,16 @@ async def get_tweet(browser: Browser,user_name:str,tweet_id: str = "0") -> dict:
                             if x.parent.attrs["class"] == "replying-to":
                                 continue
                             result["text"].append(x.text)
+                    if quote_div := main_thread_div.find('div', class_='quote'): # type: ignore
+                        if quote_text := quote_div.find('div', class_='quote-text'):
+                            result["quote_text"] = quote_text.text.strip()
+                        if quote_user := quote_div.find('a', class_='username'):
+                            result["quote_user_name"] = quote_user.text.strip().lstrip("@")
+                        if result["quote_text"]:
+                            quote_prefix = "引用"
+                            if result["quote_user_name"]:
+                                quote_prefix = f"引用 @{result['quote_user_name']}"
+                            result["text"].append(f"{quote_prefix}：\n{result['quote_text']}")
                 # r18
                 result["r18"] = bool(r18 := soup.find_all('div', class_='unavailable-box'))
                 if result["video_url"] or result["pic_url_list"]:
@@ -694,7 +775,11 @@ async def tweet_handle(tweet_info: dict,user_name: str,line_new_tweet_id: str,tw
             
             
         # 更新本地缓存
-        twitter_list[user_name]["since_id"] = line_new_tweet_id
+        current_since_id = str(twitter_list[user_name].get("since_id", "0"))
+        try:
+            twitter_list[user_name]["since_id"] = str(max(int(current_since_id), int(line_new_tweet_id)))
+        except Exception:
+            twitter_list[user_name]["since_id"] = current_since_id
         dirpath.write_text(json.dumps(twitter_list))
         return True
     
