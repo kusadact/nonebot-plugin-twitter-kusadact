@@ -170,7 +170,25 @@ def build_nitter_foot_script() -> str:
                 }}
             }};
 
-            document.querySelectorAll(".tweet-published, .tweet-date a").forEach(patchTimestamp);
+            const patchAllTimestamps = () => {{
+                document
+                    .querySelectorAll(".tweet-published, .tweet-date a")
+                    .forEach(patchTimestamp);
+            }};
+
+            patchAllTimestamps();
+
+            if (!window.__nbTwitterTimezoneObserverAttached && document.body) {{
+                const observer = new MutationObserver(() => {{
+                    patchAllTimestamps();
+                }});
+                observer.observe(document.body, {{
+                    childList: true,
+                    subtree: true,
+                    characterData: true,
+                }});
+                window.__nbTwitterTimezoneObserverAttached = true;
+            }}
         }}"""
 
 

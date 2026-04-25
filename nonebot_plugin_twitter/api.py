@@ -263,15 +263,54 @@ async def get_user_newtimeline(user_name:str,since_id: str = "0") -> str:
     except Exception as e:
         logger.warning(f"通过 user_name {user_name} 获取时间线失败：{e}")
         raise e
-    
+
+async def prepare_nitter_page(page, wait_selector: str = "") -> None:
+    await page.wait_for_load_state("load", timeout=60000)
+    if wait_selector:
+        try:
+            await page.wait_for_selector(wait_selector, timeout=5000)
+        except Exception:
+            logger.debug(f"Nitter 页面等待选择器超时：{wait_selector}")
+    await page.evaluate(nitter_head)
+    await page.evaluate(nitter_foot)
+
+    timezone_label = plugin_config.twitter_html_timezone_label or plugin_config.twitter_html_timezone
+    if not timezone_label:
+        return
+
+    try:
+        await page.wait_for_function(
+            """label => {
+                const published = document.querySelector(".tweet-published");
+                if (published) {
+                    const text = published.textContent || "";
+                    return text.includes(label) || !/UTC/i.test(text);
+                }
+
+                const nodes = Array.from(document.querySelectorAll(".tweet-date a"));
+                if (!nodes.length) {
+                    return true;
+                }
+
+                return nodes.every(node => {
+                    const title = node.getAttribute("title") || "";
+                    return !/UTC/i.test(title) || title.includes(label);
+                });
+            }""",
+            arg=timezone_label,
+            timeout=1500,
+        )
+    except Exception:
+        logger.debug("等待 Nitter 页面时区修正完成超时，继续截图")
+
 async def get_timeline_screen(browser: Browser,user_name: str,length: int = 5):
     url=f"{plugin_config.twitter_url}/{user_name}"
     context = await browser.new_context()
     page = await context.new_page()
     try:
         await page.goto(url,timeout=60000)
-        await page.wait_for_load_state("networkidle")
         await page.wait_for_selector('.timeline-item')
+        await prepare_nitter_page(page, '.timeline-item')
 
         tweets = await page.query_selector_all('.timeline-item')
         if not tweets:
@@ -334,9 +373,7 @@ async def get_tweet(browser: Browser,user_name:str,tweet_id: str = "0") -> dict:
                 screenshot_bytes = await page.locator("xpath=/html/body/div[1]/div/div/div[2]/main/div/div/div/div[1]/div/section/div/div/div[1]").screenshot()
             else:
                 await page.goto(url,timeout=60000)
-                await page.wait_for_load_state("load",timeout=60000)
-                await page.evaluate(nitter_head)
-                await page.evaluate(nitter_foot)
+                await prepare_nitter_page(page, ".tweet-published, .tweet-date a")
                 screenshot_bytes = await page.locator("xpath=/html/body/div[1]/div").screenshot(timeout=60000)
             logger.info(f"使用浏览器截图获取 {url} 推文信息成功")
             result["html"] = screenshot_bytes
