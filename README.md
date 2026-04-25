@@ -21,9 +21,7 @@ _✨ 推文订阅推送插件 ✨_
 
 </div>
 
-~~⚠ 插件暂不可用~~
-
-~~因推特开启登录墙，该插件暂不可用~~
+⚠ 需要可用的 Nitter 镜像站或自建实例。公开实例稳定性通常较差，建议自建。
 
 ## 📖 介绍
 
@@ -74,23 +72,55 @@ _✨ 推文订阅推送插件 ✨_
 | twitter_qq | 否 | 2854196310 | 合并消息头像来源 |
 | command_priority | 否 | 10 | 命令优先级 |
 | twitter_htmlmode | 否 | false | 网页截图模式 |
-| twitter_original | 否 | false | 使用x官网截图 |
+| twitter_original | 否 | false | 使用 X 官网截图 |
+| twitter_html_timezone | 否 | Asia/Shanghai | Nitter 截图时间显示时区 |
+| twitter_html_timezone_label | 否 | UTC+8 | Nitter 截图时间显示标签 |
+| twitter_browser_channel | 否 | 无 | Playwright 浏览器通道，如 `chrome` |
+| twitter_browser_executable_path | 否 | 无 | Playwright 浏览器可执行文件路径 |
+| twitter_video_send_host_path | 否 | 无 | 视频发送时复制到宿主机可见目录 |
+| twitter_video_send_container_path | 否 | 无 | 视频发送时在协议中使用的容器内路径 |
+| twitter_video_mux_api | 否 | 无 | 远程视频转码接口 |
+| twitter_video_mux_token | 否 | 无 | 远程视频转码接口鉴权 token |
+| twitter_nitter_sync_status_file | 否 | 无 | Nitter Chrome 会话同步状态文件路径 |
+| twitter_nitter_alert_qq | 否 | 0 | Nitter Chrome 登录态失效时接收告警的 QQ |
 | twitter_no_text | 否 | false | 开启媒体过滤后彻底不输出文字 |
 | twitter_node | 否 | true | 使用合并转发消息发送 |
 
 配置格式示例
 ```bash
 # twitter
+twitter_website="http://127.0.0.1:18645"
 twitter_proxy="http://127.0.0.1:1090"
 twitter_qq=2854196306
 command_priority=10
+
+# 复用系统 Chrome
+twitter_browser_channel="chrome"
+# 或直接指定路径
+# twitter_browser_executable_path="/usr/bin/google-chrome"
 
 # 使用截图纯图模式示例
 twitter_htmlmode=true
 twitter_original=false
 twitter_no_text=true
 twitter_node=false
+
+# Nitter 会话同步告警
+twitter_nitter_sync_status_file="/opt/nitter/session_sync_status.json"
+twitter_nitter_alert_qq=959472968
 ```
+
+## 自建 Nitter
+
+推荐将 `twitter_website` 指向你自己的 Nitter 实例，例如：
+
+```bash
+twitter_website="http://127.0.0.1:18645"
+```
+
+如果你在 Nitter 侧额外部署了 Chrome 会话自动续期脚本，并持续写出一个状态文件，那么插件可以读取这个文件，在检测到 `chrome_login_required=true` 时向指定 QQ 发送一次私聊告警。
+
+这部分配置只负责“读状态并发告警”，不负责替你维护 Nitter 的 cookie。
 
 ## 🎉 使用
 ### 指令表
