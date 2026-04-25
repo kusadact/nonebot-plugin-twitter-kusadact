@@ -134,6 +134,9 @@ def normalize_tweet_href(href: str) -> str:
 def parse_timeline_entries(soup: BeautifulSoup, follow_user_name: str) -> list[dict]:
     entries = []
     for timeline_item in soup.find_all("div", class_="timeline-item"):
+        if timeline_item.find("div", class_="pinned") is not None:
+            continue
+
         tweet_link = timeline_item.find("a", class_="tweet-link")
         if not tweet_link or "href" not in tweet_link.attrs:
             continue
