@@ -1,6 +1,7 @@
 import os
 import sys
-from nonebot import on_regex, require,on_command,get_driver
+import json
+from nonebot import on_regex, require,on_command,get_driver,get_bots
 require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler
 from nonebot.adapters.onebot.v11 import Message,MessageEvent,Bot,GroupMessageEvent,MessageSegment
@@ -53,10 +54,70 @@ __plugin_meta__ = PluginMetadata(
 )
 
 web_list = []
+last_nitter_sync_alert_token = None
 
 
 def normalize_website_url(url: str) -> str:
     return url.rstrip("/")
+
+
+def load_nitter_sync_status() -> dict | None:
+    status_path = plugin_config.twitter_nitter_sync_status_file
+    if not status_path:
+        return None
+
+    path = Path(status_path)
+    if not path.is_file():
+        return None
+
+    try:
+        data = json.loads(path.read_text("utf8"))
+    except Exception as e:
+        logger.warning(f"读取 Nitter 同步状态文件失败：{e}")
+        return None
+
+    return data if isinstance(data, dict) else None
+
+
+async def send_nitter_sync_alert(message: str) -> bool:
+    target_qq = plugin_config.twitter_nitter_alert_qq
+    if not target_qq:
+        return False
+
+    bots = list(get_bots().values())
+    if not bots:
+        logger.warning("Nitter 同步告警发送失败：当前没有可用 Bot 连接")
+        return False
+
+    for bot in bots:
+        try:
+            await bot.send_private_msg(user_id=target_qq, message=message)
+            return True
+        except Exception as e:
+            logger.warning(f"Nitter 同步告警发送失败：{e}")
+
+    return False
+
+
+def build_nitter_sync_alert_message(status: dict) -> str:
+    accounts = status.get("accounts") or []
+    invalid_accounts = []
+    for account in accounts:
+        if not isinstance(account, dict):
+            continue
+        if account.get("chrome_logged_in", False):
+            continue
+        label = account.get("label") or account.get("id") or "unknown"
+        invalid_accounts.append(str(label))
+
+    parts = ["推特镜像会话同步告警", "Chrome 里的 X 账号登录态失效，需要重新登录。"]
+    if invalid_accounts:
+        parts.append(f"失效账号：{', '.join(invalid_accounts)}")
+    if message := status.get("message"):
+        parts.append(f"原因：{message}")
+    if checked_at := status.get("checked_at"):
+        parts.append(f"检查时间：{checked_at}")
+    return "\n".join(parts)
 
 
 def is_valid_website_response(content: str) -> bool:
@@ -124,6 +185,27 @@ def clean_pic_cache():
     filenames = [f for f in os.listdir(path) if os.path.isfile(os.path.join(path,f))]
     timeline = int(datetime.now().timestamp()) - 60 * 60 * 5
     [os.remove(path / f) for f in filenames if int(f.split(".")[0]) <= timeline]
+
+
+if plugin_config.plugin_enabled and plugin_config.twitter_nitter_alert_qq and plugin_config.twitter_nitter_sync_status_file:
+    @scheduler.scheduled_job("interval", minutes=2, id="twitter_nitter_sync_alert", misfire_grace_time=110)
+    async def twitter_nitter_sync_alert():
+        global last_nitter_sync_alert_token
+
+        status = load_nitter_sync_status()
+        if not status:
+            return
+
+        if not status.get("chrome_login_required"):
+            last_nitter_sync_alert_token = None
+            return
+
+        alert_token = str(status.get("alert_token") or "login-required")
+        if alert_token == last_nitter_sync_alert_token:
+            return
+
+        if await send_nitter_sync_alert(build_nitter_sync_alert_message(status)):
+            last_nitter_sync_alert_token = alert_token
 
     
         

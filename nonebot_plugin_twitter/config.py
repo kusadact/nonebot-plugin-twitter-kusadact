@@ -41,6 +41,10 @@ class Config(BaseModel):
     twitter_video_mux_api: Optional[str] = None
     # 可选：远程视频转码接口鉴权 token
     twitter_video_mux_token: Optional[str] = None
+    # 可选：Nitter Chrome 会话同步状态文件
+    twitter_nitter_sync_status_file: Optional[str] = None
+    # 可选：Nitter Chrome 会话失效告警 QQ
+    twitter_nitter_alert_qq: int = 0
     # 媒体无文字
     twitter_no_text: bool = False
     # 使用转发消息
