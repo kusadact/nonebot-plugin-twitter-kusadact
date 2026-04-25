@@ -131,7 +131,7 @@ if plugin_config.plugin_enabled:
     if not plugin_config.twitter_url:
         logger.debug(f"website 推文服务器为空，跳过推文定时检索")
     else:
-        @scheduler.scheduled_job("interval", minutes=3, id="twitter", misfire_grace_time=179)
+        @scheduler.scheduled_job("interval", minutes=30, id="twitter", misfire_grace_time=179)
         async def now_twitter():
             playwright, browser = await create_browser()
             twitter_list = read_twitter_list()
