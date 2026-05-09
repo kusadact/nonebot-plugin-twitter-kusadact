@@ -5,6 +5,7 @@ import typing
 import httpx
 import os
 import shutil
+import subprocess
 from threading import RLock
 from typing import Optional,Literal
 from pathlib import Path
@@ -590,6 +591,18 @@ async def get_video_path(url: str) -> list:
                 return f"{plugin_config.twitter_url}{raw_url}"
             return raw_url
 
+        def extract_direct_video_url(raw_url: str) -> str:
+            parsed = urlparse(raw_url)
+            path = parsed.path if parsed.scheme else raw_url
+            if not path.startswith("/video/"):
+                return raw_url
+
+            parts = path.split("/", 3)
+            if len(parts) < 4:
+                return raw_url
+            decoded = unquote(parts[3])
+            return decoded if decoded.startswith(("http://", "https://")) else raw_url
+
         def resolve_nitter_url(raw_url: str) -> str:
             if raw_url.startswith("http://") or raw_url.startswith("https://"):
                 return raw_url
@@ -662,8 +675,57 @@ async def get_video_path(url: str) -> list:
             logger.info(f"通过 Nitter HLS 下载视频成功：{master_url}")
             return [abs_path]
 
+        async def download_direct_hls_video(master_url: str) -> list[str]:
+            direct_url = extract_direct_video_url(master_url)
+            if direct_url == master_url and not urlparse(direct_url).netloc.endswith("video.twimg.com"):
+                raise ValueError("未找到可直连的 video.twimg.com 视频地址")
+
+            filename = f"{int(datetime.now().timestamp())}.mp4"
+            path = Path() / "data" / "twitter" / "cache" / filename
+            abs_path = f"{os.getcwd()}/{str(path)}"
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-headers",
+                f"User-Agent: {header['User-Agent']}\r\n",
+                "-protocol_whitelist",
+                "file,http,https,tcp,tls,crypto,httpproxy",
+                "-i",
+                direct_url,
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0?",
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                abs_path,
+            ]
+            result = await asyncio.to_thread(
+                subprocess.run,
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=240,
+            )
+            if result.returncode != 0 or not os.path.exists(abs_path) or os.path.getsize(abs_path) == 0:
+                if os.path.exists(abs_path):
+                    os.remove(abs_path)
+                raise RuntimeError(result.stderr.strip() or "ffmpeg failed")
+
+            logger.info(f"通过直连 X HLS 下载视频成功：{direct_url}")
+            return [abs_path]
+
         async with httpx.AsyncClient(**build_httpx_client_kwargs(timeout=120)) as client:
             if "/video/" in url:
+                try:
+                    return await download_direct_hls_video(url)
+                except Exception as e:
+                    logger.warning(f"通过直连 X HLS 下载视频异常：url {url}，{e}")
                 if plugin_config.twitter_video_mux_api:
                     mux_headers = {}
                     if plugin_config.twitter_video_mux_token:
