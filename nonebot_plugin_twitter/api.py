@@ -264,7 +264,10 @@ async def get_user_newtimeline(user_name:str,since_id: str = "0") -> str:
         logger.warning(f"通过 user_name {user_name} 获取时间线失败：{e}")
         raise e
 
-async def prepare_nitter_screenshot_page(page) -> None:
+async def prepare_nitter_screenshot_page(page, *, block_nitter_media: bool = False) -> None:
+    if not block_nitter_media:
+        return
+
     async def _route_handler(route):
         url = route.request.url
         if route.request.resource_type in {"image", "media"} and "/pic/" in url:
