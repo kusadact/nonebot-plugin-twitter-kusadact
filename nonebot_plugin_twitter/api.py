@@ -794,7 +794,7 @@ async def get_video(file_path: str) -> MessageSegment:
                 Path(host_path).mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(file_path, target_path)
             send_path = os.path.join(container_path, filename)
-        return MessageSegment.video(f"file://{send_path}")
+        return MessageSegment.video(send_path)
     except Exception as e:
         logger.debug(f"缓存视频异常：file {file_path}，{e}")
         return MessageSegment.text("获取视频出错啦")
