@@ -10,6 +10,7 @@ from nonebot.params import CommandArg,RegexStr
 from nonebot.log import logger
 from nonebot.adapters.onebot.v11.adapter import Adapter
 from nonebot.exception import FinishedException
+from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata
 from pathlib import Path
 from importlib.metadata import version
@@ -290,6 +291,48 @@ async def get_status(user_name,twitter_list,browser:Browser) -> bool:
     except Exception as e:
         logger.debug(f"获取 {user_name} 的推文出现异常：{e}")
         return False
+
+
+twitter_manual_check = on_command(
+    "推文手动触发",
+    block=True,
+    permission=SUPERUSER,
+    priority=plugin_config.command_priority,
+)
+@twitter_manual_check.handle()
+async def twitter_manual_check_handle(matcher: Matcher, arg: Message = CommandArg()):
+    if not await ensure_twitter_url():
+        await matcher.finish("website 推文服务器访问失败，请检查连通性或代理")
+
+    user_name = arg.extract_plain_text().strip()
+    twitter_list = read_twitter_list()
+    if user_name:
+        if user_name not in twitter_list:
+            await matcher.finish(f"未订阅 {user_name}")
+        targets = [user_name]
+    else:
+        targets = list(twitter_list)
+
+    if not targets:
+        await matcher.finish("当前没有订阅推主")
+
+    await matcher.send(f"开始手动检查推文：{', '.join(targets)}")
+
+    playwright, browser = await create_browser()
+    results: list[tuple[str, bool]] = []
+    try:
+        for target in targets:
+            latest_twitter_list = read_twitter_list()
+            result = await get_status(target, latest_twitter_list, browser)
+            results.append((target, result))
+    finally:
+        await browser.close()
+        await playwright.stop()
+
+    failed = [target for target, result in results if not result]
+    if failed:
+        await matcher.finish(f"手动检查完成，失败：{', '.join(failed)}")
+    await matcher.finish("手动检查完成")
 
 
 save = on_command("关注推主",block=True,priority=plugin_config.command_priority)
