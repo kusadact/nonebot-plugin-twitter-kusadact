@@ -323,21 +323,36 @@ async def get_timeline_screen(browser: Browser,user_name: str,length: int = 5):
     url=f"{plugin_config.twitter_url}/{user_name}"
     context = await browser.new_context()
     page = await context.new_page()
+
+    async def fallback_screenshot(reason: str):
+        logger.warning(f"Nitter 时间线截图使用整页兜底：{user_name}，原因：{reason}")
+        try:
+            return await page.screenshot(full_page=True, timeout=15000)
+        except Exception as e:
+            logger.warning(f"Nitter 时间线整页兜底截图失败：{user_name}，{e}")
+            return None
+
     try:
         await prepare_nitter_screenshot_page(page)
         await page.goto(url,timeout=60000,wait_until="domcontentloaded")
-        await page.wait_for_selector('.timeline-item')
+        try:
+            await page.wait_for_selector('.timeline-item', timeout=10000)
+        except Exception as e:
+            logger.warning(f"Nitter 时间线等待条目超时：{user_name}，{e}")
         await prepare_nitter_page(page, '.timeline-item')
 
         tweets = await page.query_selector_all('.timeline-item')
         if not tweets:
-            return None
+            return await fallback_screenshot("未找到 timeline-item")
 
         visible_count = min(max(length, 1), 5, len(tweets))
         visible_tweets = tweets[:visible_count]
 
         try:
-            return await page.locator(".timeline").screenshot(timeout=15000)
+            timeline_screen = await page.locator(".timeline").nth(0).screenshot(timeout=15000)
+            if timeline_screen:
+                return timeline_screen
+            logger.warning(f"Nitter 时间线整体截图为空：{user_name}")
         except Exception as e:
             logger.debug(f"Nitter 时间线整体截图失败，转为裁剪截图：{e}")
 
@@ -356,7 +371,7 @@ async def get_timeline_screen(browser: Browser,user_name: str,length: int = 5):
                 },
             )
         logger.warning(f"Nitter 时间线截图失败：{user_name} bbox 为空")
-        return None
+        return await fallback_screenshot("bbox 为空")
     finally:
         await page.close()
         await context.close()
