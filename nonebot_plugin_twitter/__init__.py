@@ -14,7 +14,7 @@ from nonebot.plugin import PluginMetadata
 from pathlib import Path
 from importlib.metadata import version
 import random
-from httpx import AsyncClient,Client
+from httpx import AsyncClient
 import asyncio
 from playwright.async_api import async_playwright
 from .config import (
@@ -55,6 +55,7 @@ __plugin_meta__ = PluginMetadata(
 
 web_list = []
 last_nitter_sync_alert_token = None
+twitter_url_lock = asyncio.Lock()
 
 
 def normalize_website_url(url: str) -> str:
@@ -131,22 +132,39 @@ def is_valid_website_response(content: str) -> bool:
     return any(marker in content for marker in markers)
 
 
-def pick_website(client: Client) -> str:
+async def probe_website_list() -> str:
     probe_paths = ("/elonmusk", "/jack/status/20")
-    for raw_url in web_list:
-        url = normalize_website_url(raw_url)
-        for path in probe_paths:
-            full_url = f"{url}{path}"
-            try:
-                res = client.get(full_url, timeout=60)
-                if res.status_code == 200 and is_valid_website_response(res.text):
-                    logger.info(f"website: {url} ok! ({path})")
-                    return url
-            except Exception as e:
-                logger.debug(f"website选择异常：{e}")
-        logger.info(f"website: {url} failed!")
+    async with AsyncClient(**build_httpx_client_kwargs(http2=True, timeout=15)) as client:
+        for raw_url in web_list:
+            url = normalize_website_url(raw_url)
+            for path in probe_paths:
+                full_url = f"{url}{path}"
+                try:
+                    res = await client.get(full_url)
+                    if res.status_code == 200 and is_valid_website_response(res.text):
+                        logger.info(f"website: {url} ok! ({path})")
+                        return url
+                except Exception as e:
+                    logger.debug(f"website选择异常：{e}")
+            logger.debug(f"website: {url} failed!")
     return ""
 
+
+async def ensure_twitter_url() -> str:
+    if plugin_config.twitter_url:
+        return plugin_config.twitter_url
+
+    async with twitter_url_lock:
+        if plugin_config.twitter_url:
+            return plugin_config.twitter_url
+
+        picked_url = await probe_website_list()
+        if picked_url:
+            plugin_config.twitter_url = picked_url
+            logger.info(f"当前使用推文站点：{plugin_config.twitter_url}")
+        else:
+            logger.warning("未找到可用的推文站点，请检查自定义 website 或代理配置")
+        return plugin_config.twitter_url
 
 if plugin_config.twitter_website:
     logger.info("使用自定义 website")
@@ -161,6 +179,7 @@ get_driver = get_driver()
 async def pywt_init():
     if plugin_config.twitter_htmlmode and not await is_chromium_installed():
         logger.warning("Chromium browser is not installed for Playwright")
+    asyncio.create_task(ensure_twitter_url())
         
 async def create_browser():
     playwright_manager = async_playwright()
@@ -170,14 +189,6 @@ async def create_browser():
     return playwright,browser
         
 
-with Client(**build_httpx_client_kwargs(http2=True)) as client:
-    plugin_config.twitter_url = pick_website(client)
-
-if plugin_config.twitter_url:
-    logger.info(f"当前使用推文站点：{plugin_config.twitter_url}")
-else:
-    logger.warning("未找到可用的推文站点，请检查自定义 website 或代理配置")
-        
 # 清理垃圾
 @scheduler.scheduled_job("cron",hour="5")
 def clean_pic_cache():
@@ -210,32 +221,33 @@ if plugin_config.plugin_enabled and plugin_config.twitter_nitter_alert_qq and pl
     
         
 if plugin_config.plugin_enabled:
-    if not plugin_config.twitter_url:
-        logger.debug(f"website 推文服务器为空，跳过推文定时检索")
-    else:
-        @scheduler.scheduled_job("interval", minutes=30, id="twitter", misfire_grace_time=179)
-        async def now_twitter():
-            playwright, browser = await create_browser()
-            twitter_list = read_twitter_list()
-            results = []
-            try:
-                for user_name in twitter_list:
-                    # 检查单个用户状态
-                    result = await get_status(user_name, twitter_list, browser)
-                    results.append(result)
-                    # 检查完一个用户后等待5秒再检查下一个
-                    await asyncio.sleep(5)
-                    
-                if plugin_config.twitter_website == "":
-                    true_count = sum(1 for elem in results if elem)
-                    if true_count < len(results) / 2:
-                        plugin_config.twitter_url = get_next_element(website_list, plugin_config.twitter_url)
-                        logger.debug(f"检测到当前镜像站出错过多，切换镜像站至：{plugin_config.twitter_url}")
-            except Exception as e:
-                logger.warning(f"twitter 任务出错{e}")
-            finally:
-                await browser.close()
-                await playwright.stop()
+    @scheduler.scheduled_job("interval", minutes=30, id="twitter", misfire_grace_time=179)
+    async def now_twitter():
+        if not await ensure_twitter_url():
+            logger.debug(f"website 推文服务器为空，跳过推文定时检索")
+            return
+
+        playwright, browser = await create_browser()
+        twitter_list = read_twitter_list()
+        results = []
+        try:
+            for user_name in twitter_list:
+                # 检查单个用户状态
+                result = await get_status(user_name, twitter_list, browser)
+                results.append(result)
+                # 检查完一个用户后等待5秒再检查下一个
+                await asyncio.sleep(5)
+
+            if plugin_config.twitter_website == "":
+                true_count = sum(1 for elem in results if elem)
+                if true_count < len(results) / 2:
+                    plugin_config.twitter_url = get_next_element(website_list, plugin_config.twitter_url)
+                    logger.debug(f"检测到当前镜像站出错过多，切换镜像站至：{plugin_config.twitter_url}")
+        except Exception as e:
+            logger.warning(f"twitter 任务出错{e}")
+        finally:
+            await browser.close()
+            await playwright.stop()
                 
 async def get_status(user_name,twitter_list,browser:Browser) -> bool:
     # 获取推文
@@ -283,7 +295,7 @@ async def get_status(user_name,twitter_list,browser:Browser) -> bool:
 save = on_command("关注推主",block=True,priority=plugin_config.command_priority)
 @save.handle()
 async def save_handle(bot:Bot,event: MessageEvent,matcher: Matcher,arg: Message = CommandArg()):
-    if not plugin_config.twitter_url:
+    if not await ensure_twitter_url():
         await matcher.finish("website 推文服务器访问失败，请检查连通性或代理")
     data = []
     if " " in arg.extract_plain_text():
@@ -434,6 +446,8 @@ pat_twitter = on_regex(r'(twitter\.com|x\.com)/[a-zA-Z0-9_]+/status/\d+',priorit
 async def pat_twitter_handle(bot: Bot,event: MessageEvent,matcher: Matcher,text: str = RegexStr()):
     logger.info(f"检测到推文链接 {text}")
     link_list = read_link_list()
+    if not await ensure_twitter_url():
+        await matcher.finish("website 推文服务器访问失败，请检查连通性或代理")
     playwright,browser = await create_browser()
     try:
         if isinstance(event,GroupMessageEvent):
@@ -500,6 +514,9 @@ twitter_timeline = on_command("推文列表",priority=plugin_config.command_prio
 async def twitter_timeline_handle(bot: Bot,event: MessageEvent,matcher: Matcher,arg: Message = CommandArg()):
     if not plugin_config.twitter_htmlmode:
         await matcher.finish(f"暂时仅支持html模式，请先联系超级管理员开启")
+
+    if not await ensure_twitter_url():
+        await matcher.finish("website 推文服务器访问失败，请检查连通性或代理")
     
     await matcher.send(f"获取中, 请稍等一下..")
     
