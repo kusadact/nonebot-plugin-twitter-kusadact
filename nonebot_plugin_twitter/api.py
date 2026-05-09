@@ -264,8 +264,23 @@ async def get_user_newtimeline(user_name:str,since_id: str = "0") -> str:
         logger.warning(f"通过 user_name {user_name} 获取时间线失败：{e}")
         raise e
 
+async def prepare_nitter_screenshot_page(page) -> None:
+    async def _route_handler(route):
+        if route.request.resource_type in {"image", "media", "font"}:
+            await route.abort()
+            return
+        await route.continue_()
+
+    try:
+        await page.route("**/*", _route_handler)
+    except Exception as e:
+        logger.debug(f"Nitter 页面资源拦截设置失败：{e}")
+
 async def prepare_nitter_page(page, wait_selector: str = "") -> None:
-    await page.wait_for_load_state("load", timeout=60000)
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=15000)
+    except Exception:
+        logger.debug("Nitter 页面等待 DOMContentLoaded 超时，继续处理")
     if wait_selector:
         try:
             await page.wait_for_selector(wait_selector, timeout=5000)
@@ -308,7 +323,8 @@ async def get_timeline_screen(browser: Browser,user_name: str,length: int = 5):
     context = await browser.new_context()
     page = await context.new_page()
     try:
-        await page.goto(url,timeout=60000)
+        await prepare_nitter_screenshot_page(page)
+        await page.goto(url,timeout=60000,wait_until="domcontentloaded")
         await page.wait_for_selector('.timeline-item')
         await prepare_nitter_page(page, '.timeline-item')
 
@@ -372,7 +388,8 @@ async def get_tweet(browser: Browser,user_name:str,tweet_id: str = "0") -> dict:
                 await page.evaluate(twitter_post)
                 screenshot_bytes = await page.locator("xpath=/html/body/div[1]/div/div/div[2]/main/div/div/div/div[1]/div/section/div/div/div[1]").screenshot()
             else:
-                await page.goto(url,timeout=60000)
+                await prepare_nitter_screenshot_page(page)
+                await page.goto(url,timeout=60000,wait_until="domcontentloaded")
                 await prepare_nitter_page(page, ".tweet-published, .tweet-date a")
                 screenshot_bytes = await page.locator("xpath=/html/body/div[1]/div").screenshot(timeout=60000)
             logger.info(f"使用浏览器截图获取 {url} 推文信息成功")
@@ -620,20 +637,37 @@ async def get_video(file_path: str) -> MessageSegment:
         
 async def get_pic(url: str) -> MessageSegment:
     '修改为返回图片消息，而非合并图片消息'
+    per_request_timeout = 20
+    retry_times = 2
+
+    def build_pbs_fallback(decoded_url: str) -> list[str]:
+        if not decoded_url.startswith("/pic/"):
+            return []
+
+        path = decoded_url.removeprefix("/pic/")
+        if path.startswith(("https://", "http://")):
+            return [path]
+
+        fallbacks: list[str] = []
+        if path.startswith("orig/media/"):
+            filename = path.removeprefix("orig/media/")
+            stem, ext = os.path.splitext(filename)
+            ext = ext.lstrip(".").lower()
+            if stem and ext:
+                fallbacks.append(f"{plugin_config.twitter_img_url}{stem}?format={ext}&name=large")
+            fallbacks.append(f"https://pbs.twimg.com/media/{filename}")
+            return fallbacks
+
+        if path:
+            fallbacks.append(f"https://pbs.twimg.com/{path.lstrip('/')}")
+        return fallbacks
+
     def build_image_candidates(raw_url: str) -> list[str]:
         candidates: list[str] = []
         if raw_url.startswith("/"):
             candidates.append(f"{plugin_config.twitter_url}{raw_url}")
-
             decoded = unquote(raw_url)
-            if decoded.startswith("/pic/orig/media/"):
-                filename = decoded.removeprefix("/pic/orig/media/")
-                stem, ext = os.path.splitext(filename)
-                ext = ext.lstrip(".").lower()
-                if stem and ext:
-                    candidates.append(
-                        f"{plugin_config.twitter_img_url}{stem}?format={ext}&name=large"
-                    )
+            candidates.extend(build_pbs_fallback(decoded))
         else:
             candidates.append(raw_url)
 
@@ -647,17 +681,20 @@ async def get_pic(url: str) -> MessageSegment:
     async with httpx.AsyncClient(**build_httpx_client_kwargs(http2=True)) as client:
         last_error = ""
         for candidate in candidates:
-            try:
-                res = await client.get(candidate, headers=header, timeout=120)
-                if res.status_code != 200:
-                    last_error = f"HTTP {res.status_code}"
-                    logger.warning(f"图片下载失败:{candidate}，状态码：{res.status_code}")
-                    continue
-                tmp = bytes(random.randint(0,255))
-                return MessageSegment.image(file=(res.read()+tmp))
-            except Exception as e:
-                last_error = str(e)
-                logger.warning(f"获取图片出现异常 {candidate} ：{e}")
+            for attempt in range(1, retry_times + 1):
+                try:
+                    res = await client.get(candidate, headers=header, timeout=per_request_timeout)
+                    if res.status_code != 200:
+                        last_error = f"HTTP {res.status_code}"
+                        logger.warning(
+                            f"图片下载失败:{candidate}，状态码：{res.status_code}，尝试 {attempt}/{retry_times}"
+                        )
+                        continue
+                    tmp = bytes(random.randint(0,255))
+                    return MessageSegment.image(file=(res.read()+tmp))
+                except Exception as e:
+                    last_error = str(e)
+                    logger.warning(f"获取图片出现异常 {candidate}，尝试 {attempt}/{retry_times}：{e}")
 
         failed_url = candidates[0] if candidates else url
         if last_error:
