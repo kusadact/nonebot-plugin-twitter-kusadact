@@ -114,13 +114,6 @@ def build_nitter_foot_script() -> str:
     timezone = plugin_config.twitter_html_timezone or ""
     timezone_label = plugin_config.twitter_html_timezone_label or timezone
     return f"""() => {{
-            const elementXPath = '/html/body/div[1]/div/div[3]/div';
-            const element = document.evaluate(elementXPath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-
-            if (element) {{
-                element.remove();
-            }}
-
             const timezone = {json.dumps(timezone)};
             const timezoneLabel = {json.dumps(timezone_label)};
             if (!timezone) {{
