@@ -9,7 +9,7 @@ from threading import RLock
 from typing import Optional,Literal
 from pathlib import Path
 from datetime import datetime
-from urllib.parse import quote, unquote, urljoin
+from urllib.parse import quote, unquote, urljoin, urlparse
 from bs4 import BeautifulSoup
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import MessageSegment,Message
@@ -264,14 +264,75 @@ async def get_user_newtimeline(user_name:str,since_id: str = "0") -> str:
         logger.warning(f"通过 user_name {user_name} 获取时间线失败：{e}")
         raise e
 
+def build_pbs_fallback_urls(raw_url: str, *, image_size: str = "large") -> list[str]:
+    decoded_url = unquote(raw_url)
+    parsed = urlparse(decoded_url)
+    path = parsed.path if parsed.scheme else decoded_url
+
+    if not path.startswith("/pic/"):
+        return []
+
+    media_path = path.removeprefix("/pic/")
+    if media_path.startswith(("https://", "http://")):
+        return [media_path]
+
+    fallbacks: list[str] = []
+    if media_path.startswith("orig/media/"):
+        filename = media_path.removeprefix("orig/media/")
+        stem, ext = os.path.splitext(filename)
+        ext = ext.lstrip(".").lower()
+        if stem and ext:
+            fallbacks.append(f"{plugin_config.twitter_img_url}{stem}?format={ext}&name={image_size}")
+        fallbacks.append(f"https://pbs.twimg.com/media/{filename}")
+        return fallbacks
+
+    if media_path:
+        fallbacks.append(f"https://pbs.twimg.com/{media_path.lstrip('/')}")
+    return fallbacks
+
+
+def build_image_candidates(raw_url: str, *, include_original: bool = True, image_size: str = "large") -> list[str]:
+    candidates: list[str] = []
+    if include_original:
+        if raw_url.startswith("/"):
+            candidates.append(f"{plugin_config.twitter_url}{raw_url}")
+        else:
+            candidates.append(raw_url)
+    candidates.extend(build_pbs_fallback_urls(raw_url, image_size=image_size))
+
+    deduped: list[str] = []
+    for candidate in candidates:
+        if candidate not in deduped:
+            deduped.append(candidate)
+    return deduped
+
+
 async def prepare_nitter_screenshot_page(page, *, block_nitter_media: bool = False) -> None:
-    if not block_nitter_media:
-        return
 
     async def _route_handler(route):
         url = route.request.url
         if route.request.resource_type in {"image", "media"} and "/pic/" in url:
-            await route.abort()
+            if block_nitter_media:
+                await route.abort()
+                return
+
+            candidates = build_image_candidates(url, include_original=False, image_size="small")
+            if candidates:
+                try:
+                    async with httpx.AsyncClient(**build_httpx_client_kwargs(http2=True, timeout=20)) as client:
+                        for candidate in candidates:
+                            res = await client.get(candidate, headers=header)
+                            content_type = res.headers.get("content-type", "")
+                            if res.status_code == 200 and content_type.startswith("image/"):
+                                await route.fulfill(
+                                    status=200,
+                                    headers={"content-type": content_type},
+                                    body=res.content,
+                                )
+                                return
+                except Exception as e:
+                    logger.debug(f"Nitter 截图图片代理回填失败：{url}，{e}")
+            await route.continue_()
             return
         await route.continue_()
 
@@ -279,6 +340,20 @@ async def prepare_nitter_screenshot_page(page, *, block_nitter_media: bool = Fal
         await page.route("**/*", _route_handler)
     except Exception as e:
         logger.debug(f"Nitter 页面资源拦截设置失败：{e}")
+
+
+async def wait_for_nitter_media_images(page, timeout: int = 8000) -> None:
+    try:
+        await page.wait_for_function(
+            """() => {
+                const images = Array.from(document.images)
+                    .filter(img => img.src.includes("/pic/"));
+                return images.every(img => img.complete && img.naturalWidth > 0);
+            }""",
+            timeout=timeout,
+        )
+    except Exception:
+        logger.debug("等待 Nitter 截图图片加载完成超时，继续截图")
 
 async def prepare_nitter_page(page, wait_selector: str = "") -> None:
     try:
@@ -321,6 +396,7 @@ async def prepare_nitter_page(page, wait_selector: str = "") -> None:
         )
     except Exception:
         logger.debug("等待 Nitter 页面时区修正完成超时，继续截图")
+    await wait_for_nitter_media_images(page)
 
 async def get_timeline_screen(browser: Browser,user_name: str,length: int = 5):
     url=f"{plugin_config.twitter_url}/{user_name}"
@@ -664,43 +740,6 @@ async def get_pic(url: str) -> MessageSegment:
     '修改为返回图片消息，而非合并图片消息'
     per_request_timeout = 20
     retry_times = 2
-
-    def build_pbs_fallback(decoded_url: str) -> list[str]:
-        if not decoded_url.startswith("/pic/"):
-            return []
-
-        path = decoded_url.removeprefix("/pic/")
-        if path.startswith(("https://", "http://")):
-            return [path]
-
-        fallbacks: list[str] = []
-        if path.startswith("orig/media/"):
-            filename = path.removeprefix("orig/media/")
-            stem, ext = os.path.splitext(filename)
-            ext = ext.lstrip(".").lower()
-            if stem and ext:
-                fallbacks.append(f"{plugin_config.twitter_img_url}{stem}?format={ext}&name=large")
-            fallbacks.append(f"https://pbs.twimg.com/media/{filename}")
-            return fallbacks
-
-        if path:
-            fallbacks.append(f"https://pbs.twimg.com/{path.lstrip('/')}")
-        return fallbacks
-
-    def build_image_candidates(raw_url: str) -> list[str]:
-        candidates: list[str] = []
-        if raw_url.startswith("/"):
-            candidates.append(f"{plugin_config.twitter_url}{raw_url}")
-            decoded = unquote(raw_url)
-            candidates.extend(build_pbs_fallback(decoded))
-        else:
-            candidates.append(raw_url)
-
-        deduped: list[str] = []
-        for candidate in candidates:
-            if candidate not in deduped:
-                deduped.append(candidate)
-        return deduped
 
     candidates = build_image_candidates(url)
     async with httpx.AsyncClient(**build_httpx_client_kwargs(http2=True)) as client:
