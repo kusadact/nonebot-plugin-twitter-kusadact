@@ -2,6 +2,7 @@ import json
 import random
 import sys
 import typing
+import asyncio
 import httpx
 import os
 import shutil
