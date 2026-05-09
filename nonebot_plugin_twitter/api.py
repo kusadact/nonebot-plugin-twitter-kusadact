@@ -266,7 +266,8 @@ async def get_user_newtimeline(user_name:str,since_id: str = "0") -> str:
 
 async def prepare_nitter_screenshot_page(page) -> None:
     async def _route_handler(route):
-        if route.request.resource_type in {"image", "media", "font"}:
+        url = route.request.url
+        if route.request.resource_type in {"image", "media"} and "/pic/" in url:
             await route.abort()
             return
         await route.continue_()
