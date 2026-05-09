@@ -784,6 +784,14 @@ async def get_video(file_path: str) -> MessageSegment:
     # return MessageSegment.node_custom(user_id=user_id, nickname=name,
     #                                       content=Message(MessageSegment.video(f"file:///{task}"))) 
     try:
+        if plugin_config.twitter_video_send_base_url:
+            filename = os.path.basename(file_path)
+            video_url = (
+                f"{plugin_config.twitter_video_send_base_url.rstrip('/')}"
+                f"/twitter/cache/{quote(filename)}"
+            )
+            return MessageSegment.video(video_url)
+
         send_path = file_path
         host_path = plugin_config.twitter_video_send_host_path
         container_path = plugin_config.twitter_video_send_container_path

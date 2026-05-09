@@ -37,6 +37,8 @@ class Config(BaseModel):
     twitter_video_send_host_path: Optional[str] = None
     # 可选：视频文件发送时在协议中使用的容器内路径
     twitter_video_send_container_path: Optional[str] = None
+    # 可选：视频文件发送时暴露给 OneBot 实现下载的内部 HTTP 地址
+    twitter_video_send_base_url: Optional[str] = None
     # 可选：远程视频转码接口
     twitter_video_mux_api: Optional[str] = None
     # 可选：远程视频转码接口鉴权 token

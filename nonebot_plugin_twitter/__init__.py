@@ -18,6 +18,7 @@ import random
 from httpx import AsyncClient
 import asyncio
 from playwright.async_api import async_playwright
+from starlette.responses import FileResponse, Response
 from .config import (
     Config,
     get_browser_launch_kwargs,
@@ -176,6 +177,23 @@ for url in website_list:
         web_list.append(normalized_url)
 
 get_driver = get_driver()
+
+async def serve_twitter_cache(filename: str):
+    if "/" in filename or "\\" in filename:
+        return Response(status_code=404)
+    path = (Path() / "data" / "twitter" / "cache" / filename).resolve()
+    cache_dir = (Path() / "data" / "twitter" / "cache").resolve()
+    if cache_dir not in path.parents or not path.is_file():
+        return Response(status_code=404)
+    return FileResponse(path, media_type="video/mp4", filename=filename)
+
+if hasattr(get_driver, "server_app"):
+    get_driver.server_app.add_api_route(
+        "/twitter/cache/{filename}",
+        serve_twitter_cache,
+        methods=["GET"],
+    )
+
 @get_driver.on_startup
 async def pywt_init():
     if plugin_config.twitter_htmlmode and not await is_chromium_installed():
