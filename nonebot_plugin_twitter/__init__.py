@@ -335,6 +335,57 @@ async def twitter_manual_check_handle(matcher: Matcher, arg: Message = CommandAr
     await matcher.finish("手动检查完成")
 
 
+twitter_video_test = on_command(
+    "推文视频测试",
+    block=True,
+    permission=SUPERUSER,
+    priority=plugin_config.command_priority,
+)
+@twitter_video_test.handle()
+async def twitter_video_test_handle(
+    bot: Bot,
+    event: MessageEvent,
+    matcher: Matcher,
+    arg: Message = CommandArg(),
+):
+    if not await ensure_twitter_url():
+        await matcher.finish("website 推文服务器访问失败，请检查连通性或代理")
+
+    data = arg.extract_plain_text().strip().split()
+    if len(data) != 2:
+        await matcher.finish("格式：推文视频测试 <推主id> <推文id>")
+
+    user_name, tweet_id = data
+    await matcher.send(f"开始测试视频推文：{user_name}/status/{tweet_id}")
+
+    playwright, browser = await create_browser()
+    try:
+        tweet_info = await get_tweet(browser, user_name, tweet_id)
+        msg = await tweet_handle_link(tweet_info, user_name, tweet_id)
+        if not msg:
+            await matcher.finish("未生成可发送消息")
+
+        if plugin_config.twitter_node and all(segment.type == "node" for segment in msg):
+            if isinstance(event, GroupMessageEvent):
+                await bot.send_group_forward_msg(group_id=int(event.group_id), messages=msg)
+            else:
+                await bot.send_private_forward_msg(user_id=int(event.user_id), messages=msg)
+        elif any(segment.type == "video" for segment in msg):
+            for segment in msg:
+                await matcher.send(segment, reply_message=True)
+        else:
+            await matcher.send(msg, reply_message=True)
+
+        await matcher.finish("视频推文测试完成")
+    except FinishedException:
+        pass
+    except Exception as e:
+        await matcher.finish(f"异常:{e}")
+    finally:
+        await browser.close()
+        await playwright.stop()
+
+
 save = on_command("关注推主",block=True,priority=plugin_config.command_priority)
 @save.handle()
 async def save_handle(bot:Bot,event: MessageEvent,matcher: Matcher,arg: Message = CommandArg()):
