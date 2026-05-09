@@ -336,6 +336,11 @@ async def get_timeline_screen(browser: Browser,user_name: str,length: int = 5):
         visible_count = min(max(length, 1), 5, len(tweets))
         visible_tweets = tweets[:visible_count]
 
+        try:
+            return await page.locator(".timeline").screenshot(timeout=15000)
+        except Exception as e:
+            logger.debug(f"Nitter 时间线整体截图失败，转为裁剪截图：{e}")
+
         first_bbox = await visible_tweets[0].bounding_box()
         last_bbox = await visible_tweets[-1].bounding_box()
         if first_bbox and last_bbox:
@@ -350,6 +355,7 @@ async def get_timeline_screen(browser: Browser,user_name: str,length: int = 5):
                     'height': total_height,
                 },
             )
+        logger.warning(f"Nitter 时间线截图失败：{user_name} bbox 为空")
         return None
     finally:
         await page.close()
