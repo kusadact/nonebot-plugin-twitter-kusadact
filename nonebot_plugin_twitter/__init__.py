@@ -27,6 +27,7 @@ from .config import (
     website_list,
 )
 from .api import *
+from .timeline import get_new_timeline_entries, get_recent_timeline_signatures
 
 
 __plugin_meta__ = PluginMetadata(

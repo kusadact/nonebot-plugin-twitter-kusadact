@@ -28,6 +28,13 @@ from .config import (
     nitter_foot,
     nitter_head,
 )
+from .timeline import (
+    build_timeline_signature,
+    get_new_timeline_entries,
+    get_recent_timeline_signatures,
+    normalize_timeline_signature,
+    normalize_tweet_href,
+)
 
 # Path
 dirpath = Path() / "data" / "twitter"
@@ -59,9 +66,6 @@ header = {
         "Pragma": "no-cache",
         "Cache-Control": "no-cache",
     }
-
-TIMELINE_SEEN_LIMIT = 50
-
 
 def _read_json_dict(path: Path) -> dict:
     try:
@@ -129,10 +133,6 @@ def build_httpx_client_kwargs(*, http2: bool = False, timeout: Optional[float] =
     return kwargs
 
 
-def normalize_tweet_href(href: str) -> str:
-    return href.split("#", 1)[0]
-
-
 def parse_timeline_entries(soup: BeautifulSoup, follow_user_name: str) -> list[dict]:
     entries = []
     for timeline_item in soup.find_all("div", class_="timeline-item"):
@@ -162,7 +162,7 @@ def parse_timeline_entries(soup: BeautifulSoup, follow_user_name: str) -> list[d
                 "source_user_name": source_user_name,
                 "tweet_id": tweet_id,
                 "href": href,
-                "signature": f"{'retweet' if is_retweet else 'tweet'}:{href}",
+                "signature": build_timeline_signature(href),
                 "is_retweet": is_retweet,
                 "is_quote": is_quote,
             }
@@ -170,28 +170,6 @@ def parse_timeline_entries(soup: BeautifulSoup, follow_user_name: str) -> list[d
 
     return entries
 
-
-def get_recent_timeline_signatures(entries: list[dict], limit: int = TIMELINE_SEEN_LIMIT) -> list[str]:
-    return [entry["signature"] for entry in entries[:limit]]
-
-
-def get_new_timeline_entries(entries: list[dict], seen_signatures: list[str]) -> list[dict]:
-    if not entries or not seen_signatures:
-        return []
-
-    current_signatures = {entry["signature"] for entry in entries}
-    if not current_signatures.intersection(seen_signatures):
-        return []
-
-    seen_signature_set = set(seen_signatures)
-    new_entries = []
-    for entry in entries:
-        if entry["signature"] in seen_signature_set:
-            break
-        new_entries.append(entry)
-
-    new_entries.reverse()
-    return new_entries
 
 async def get_user_info(user_name:str) -> dict:
     '''通过 user_name 获取信息详情,
