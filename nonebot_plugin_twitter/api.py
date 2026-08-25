@@ -15,7 +15,7 @@ from urllib.parse import quote, unquote, urljoin, urlparse
 from bs4 import BeautifulSoup
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import MessageSegment,Message
-from playwright.async_api import async_playwright,Browser
+from playwright.async_api import Browser
 from nonebot_plugin_sendmsg_by_bots import tools
 from .config import (
     Config,
@@ -848,21 +848,6 @@ async def get_pic(url: str) -> MessageSegment:
 
 
 
-async def is_chromium_installed():
-    '''check chromium install | 检测Chromium是否已经安装'''
-    playwright = None
-    browser = None
-    try:
-        playwright_manager = async_playwright()
-        playwright = await playwright_manager.start()
-        browser = await playwright.chromium.launch(**get_browser_launch_kwargs())
-        return True
-    except Exception:
-        return False
-    finally:
-        await close_browser_resources(playwright, browser)
-    
-    
 # 发送
 async def send_msg(twitter_list: dict,user_name: str,line_new_tweet_id: str,tweet_info: dict,msg: Message,mode:Optional[Literal["node","direct","video"]] = "node"):
     for group_num in twitter_list[user_name]["group"]:

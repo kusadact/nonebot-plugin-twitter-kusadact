@@ -198,8 +198,6 @@ if hasattr(get_driver, "server_app"):
 
 @get_driver.on_startup
 async def pywt_init():
-    if plugin_config.twitter_htmlmode and not await is_chromium_installed():
-        logger.warning("Chromium browser is not installed for Playwright")
     asyncio.create_task(ensure_twitter_url())
         
 async def create_browser():
