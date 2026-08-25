@@ -59,6 +59,7 @@ __plugin_meta__ = PluginMetadata(
 web_list = []
 last_nitter_sync_alert_token = None
 twitter_url_lock = asyncio.Lock()
+twitter_status_timeout_seconds = 180
 
 
 def normalize_website_url(url: str) -> str:
@@ -203,10 +204,15 @@ async def pywt_init():
         
 async def create_browser():
     playwright_manager = async_playwright()
-    playwright = await playwright_manager.start()
-    launch_kwargs = get_browser_launch_kwargs()
-    browser = await playwright.chromium.launch(**launch_kwargs)
-    return playwright,browser
+    playwright = None
+    try:
+        playwright = await playwright_manager.start()
+        launch_kwargs = get_browser_launch_kwargs()
+        browser = await playwright.chromium.launch(**launch_kwargs)
+        return playwright,browser
+    except BaseException:
+        await close_browser_resources(playwright, None)
+        raise
         
 
 # 清理垃圾
@@ -247,13 +253,22 @@ if plugin_config.plugin_enabled:
             logger.debug(f"website 推文服务器为空，跳过推文定时检索")
             return
 
-        playwright, browser = await create_browser()
-        twitter_list = read_twitter_list()
-        results = []
+        playwright = None
+        browser = None
         try:
+            playwright, browser = await create_browser()
+            twitter_list = read_twitter_list()
+            results = []
             for user_name in twitter_list:
                 # 检查单个用户状态
-                result = await get_status(user_name, twitter_list, browser)
+                try:
+                    result = await asyncio.wait_for(
+                        get_status(user_name, twitter_list, browser),
+                        timeout=twitter_status_timeout_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"获取 {user_name} 的推文超时，跳过本次检查")
+                    result = False
                 results.append(result)
                 # 检查完一个用户后等待5秒再检查下一个
                 await asyncio.sleep(5)
@@ -266,8 +281,7 @@ if plugin_config.plugin_enabled:
         except Exception as e:
             logger.warning(f"twitter 任务出错{e}")
         finally:
-            await browser.close()
-            await playwright.stop()
+            await close_browser_resources(playwright, browser)
                 
 async def get_status(user_name,twitter_list,browser:Browser) -> bool:
     # 获取推文
@@ -467,8 +481,10 @@ async def pat_twitter_handle(bot: Bot,event: MessageEvent,matcher: Matcher,text:
     link_list = read_link_list()
     if not await ensure_twitter_url():
         await matcher.finish("website 推文服务器访问失败，请检查连通性或代理")
-    playwright,browser = await create_browser()
+    playwright = None
+    browser = None
     try:
+        playwright,browser = await create_browser()
         if isinstance(event,GroupMessageEvent):
             # 是群，处理一下先
             if str(event.group_id) not in link_list:
@@ -507,8 +523,7 @@ async def pat_twitter_handle(bot: Bot,event: MessageEvent,matcher: Matcher,text:
     except Exception as e:
         await matcher.send(f"异常:{e}")
     finally:
-        await browser.close()
-        await playwright.stop()
+        await close_browser_resources(playwright, browser)
         await matcher.finish()
         
 twitter_link = on_command("推文链接识别",priority=plugin_config.command_priority)
@@ -548,8 +563,10 @@ async def twitter_timeline_handle(bot: Bot,event: MessageEvent,matcher: Matcher,
         await matcher.finish(f"未找到 {arg.extract_plain_text()} 存在推文时间线")
     if len(new_line) > 5:
         new_line = new_line[:5]
-    playwright,browser = await create_browser()
+    playwright = None
+    browser = None
     try:
+        playwright,browser = await create_browser()
         screen = await get_timeline_screen(browser,user_info["user_name"],len(new_line))
         if not screen:
             await matcher.finish("好像失败了...")
@@ -559,6 +576,5 @@ async def twitter_timeline_handle(bot: Bot,event: MessageEvent,matcher: Matcher,
     except Exception as e:
         await matcher.send(f"异常:{e}")
     finally:
-        await browser.close()
-        await playwright.stop()
+        await close_browser_resources(playwright, browser)
         await matcher.finish()

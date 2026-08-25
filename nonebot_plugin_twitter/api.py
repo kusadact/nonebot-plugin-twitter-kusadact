@@ -133,6 +133,34 @@ def build_httpx_client_kwargs(*, http2: bool = False, timeout: Optional[float] =
     return kwargs
 
 
+async def close_page_context(page, context) -> None:
+    if page is not None:
+        try:
+            await page.close()
+        except Exception as e:
+            logger.debug(f"关闭 Playwright 页面失败：{e}")
+
+    if context is not None:
+        try:
+            await context.close()
+        except Exception as e:
+            logger.debug(f"关闭 Playwright 上下文失败：{e}")
+
+
+async def close_browser_resources(playwright, browser) -> None:
+    try:
+        if browser is not None:
+            await browser.close()
+    except Exception as e:
+        logger.debug(f"关闭 Playwright 浏览器失败：{e}")
+    finally:
+        if playwright is not None:
+            try:
+                await playwright.stop()
+            except Exception as e:
+                logger.debug(f"停止 Playwright driver 失败：{e}")
+
+
 def parse_timeline_entries(soup: BeautifulSoup, follow_user_name: str) -> list[dict]:
     entries = []
     for timeline_item in soup.find_all("div", class_="timeline-item"):
@@ -380,8 +408,8 @@ async def prepare_nitter_page(page, wait_selector: str = "") -> None:
 
 async def get_timeline_screen(browser: Browser,user_name: str,length: int = 5):
     url=f"{plugin_config.twitter_url}/{user_name}"
-    context = await browser.new_context()
-    page = await context.new_page()
+    context = None
+    page = None
 
     async def fallback_screenshot(reason: str):
         logger.warning(f"Nitter 时间线截图使用整页兜底：{user_name}，原因：{reason}")
@@ -392,6 +420,8 @@ async def get_timeline_screen(browser: Browser,user_name: str,length: int = 5):
             return None
 
     try:
+        context = await browser.new_context()
+        page = await context.new_page()
         await prepare_nitter_screenshot_page(page)
         await page.goto(url,timeout=60000,wait_until="domcontentloaded")
         try:
@@ -432,8 +462,7 @@ async def get_timeline_screen(browser: Browser,user_name: str,length: int = 5):
         logger.warning(f"Nitter 时间线截图失败：{user_name} bbox 为空")
         return await fallback_screenshot("bbox 为空")
     finally:
-        await page.close()
-        await context.close()
+        await close_page_context(page, context)
     
 async def get_tweet(browser: Browser,user_name:str,tweet_id: str = "0") -> dict:
     '''通过 user_name 和 tweet_id 获取推文详情,
@@ -453,30 +482,33 @@ async def get_tweet(browser: Browser,user_name:str,tweet_id: str = "0") -> dict:
         url=f"{plugin_config.twitter_url}/{user_name}/status/{tweet_id}"
 
         if plugin_config.twitter_htmlmode:
-            context = await browser.new_context()
-            page = await context.new_page()
-            cookie: typing.List[SetCookieParam] = [{
-                "url": plugin_config.twitter_url,
-                "name": "hlsPlayback",
-                "value": "on"}]
-            await context.add_cookies(cookie)
-            if plugin_config.twitter_original:
-                # 原版 twitter
-                url=f"https://twitter.com/{user_name}/status/{tweet_id}"
-                await page.goto(url,timeout=60000)
-                await page.wait_for_load_state("load",timeout=60000)
-                await page.evaluate(twitter_login)
-                await page.evaluate(twitter_post)
-                screenshot_bytes = await page.locator("xpath=/html/body/div[1]/div/div/div[2]/main/div/div/div/div[1]/div/section/div/div/div[1]").screenshot()
-            else:
-                await prepare_nitter_screenshot_page(page)
-                await page.goto(url,timeout=60000,wait_until="domcontentloaded")
-                await prepare_nitter_page(page, ".tweet-published, .tweet-date a")
-                screenshot_bytes = await page.locator("xpath=/html/body/div[1]/div").screenshot(timeout=60000)
-            logger.info(f"使用浏览器截图获取 {url} 推文信息成功")
-            result["html"] = screenshot_bytes
-            await page.close()
-            await context.close()
+            context = None
+            page = None
+            try:
+                context = await browser.new_context()
+                page = await context.new_page()
+                cookie: typing.List[SetCookieParam] = [{
+                    "url": plugin_config.twitter_url,
+                    "name": "hlsPlayback",
+                    "value": "on"}]
+                await context.add_cookies(cookie)
+                if plugin_config.twitter_original:
+                    # 原版 twitter
+                    url=f"https://twitter.com/{user_name}/status/{tweet_id}"
+                    await page.goto(url,timeout=60000)
+                    await page.wait_for_load_state("load",timeout=60000)
+                    await page.evaluate(twitter_login)
+                    await page.evaluate(twitter_post)
+                    screenshot_bytes = await page.locator("xpath=/html/body/div[1]/div/div/div[2]/main/div/div/div/div[1]/div/section/div/div/div[1]").screenshot()
+                else:
+                    await prepare_nitter_screenshot_page(page)
+                    await page.goto(url,timeout=60000,wait_until="domcontentloaded")
+                    await prepare_nitter_page(page, ".tweet-published, .tweet-date a")
+                    screenshot_bytes = await page.locator("xpath=/html/body/div[1]/div").screenshot(timeout=60000)
+                logger.info(f"使用浏览器截图获取 {url} 推文信息成功")
+                result["html"] = screenshot_bytes
+            finally:
+                await close_page_context(page, context)
 
         async with httpx.AsyncClient(**build_httpx_client_kwargs(http2=True, timeout=120)) as client:
             res = await client.get(url,cookies={"hlsPlayback": "on"},headers=header)
@@ -818,15 +850,17 @@ async def get_pic(url: str) -> MessageSegment:
 
 async def is_chromium_installed():
     '''check chromium install | 检测Chromium是否已经安装'''
+    playwright = None
+    browser = None
     try:
         playwright_manager = async_playwright()
         playwright = await playwright_manager.start()
         browser = await playwright.chromium.launch(**get_browser_launch_kwargs())
-        await browser.close()
-        await playwright.stop()
         return True
     except Exception:
         return False
+    finally:
+        await close_browser_resources(playwright, browser)
     
     
 # 发送
