@@ -201,6 +201,17 @@ async def pywt_init():
     asyncio.create_task(ensure_twitter_url())
         
 async def create_browser():
+    try:
+        from nonebot_plugin_htmlrender.browser import get_browser as get_htmlrender_browser
+    except ImportError:
+        get_htmlrender_browser = None
+
+    if get_htmlrender_browser is not None:
+        try:
+            return None, await get_htmlrender_browser()
+        except Exception as e:
+            logger.debug(f"复用 HTMLRender 浏览器失败，回退到独立 Playwright：{e}")
+
     playwright_manager = async_playwright()
     playwright = None
     try:

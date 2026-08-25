@@ -149,7 +149,7 @@ async def close_page_context(page, context) -> None:
 
 async def close_browser_resources(playwright, browser) -> None:
     try:
-        if browser is not None:
+        if playwright is not None and browser is not None:
             await browser.close()
     except Exception as e:
         logger.debug(f"关闭 Playwright 浏览器失败：{e}")
