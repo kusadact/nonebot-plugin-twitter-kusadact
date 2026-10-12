@@ -216,7 +216,8 @@ async def pywt_init():
         renderer = make_tweet_renderer()
         twitter_manual_queue = ManualLinkQueue(
             Path("data/twitter/manual_links.json"),
-            prepare_delivery=prepare_tweet_delivery, send_part=send_manual_tweet_part,
+            prepare_delivery=prepare_manual_tweet_delivery, send_part=send_manual_tweet_part,
+            prepare_photos=prepare_manual_photos,
         )
         twitter_pipeline = TweetPipeline(
             read_state=read_twitter_list, update_state=update_twitter_list,
@@ -515,17 +516,20 @@ async def send_manual_tweet_part(target, mode, segments):
     if bot is None:
         raise ValueError("bot_disconnected")
     message = deserialize_message(segments)
-    if mode == "node":
-        if target["kind"] == "group":
-            await bot.send_group_forward_msg(group_id=target["group_id"], messages=message)
+    # Old persisted previews may contain forward nodes; send their frozen content directly.
+    direct = Message()
+    for segment in message:
+        if segment.type == "node":
+            direct += Message(segment.data["content"])
         else:
-            await bot.send_private_forward_msg(user_id=target["user_id"], messages=message)
-    else:
+            direct.append(segment)
+    message = direct
+    if mode == "reply":
         message = Message(MessageSegment.reply(target["message_id"])) + message
-        if target["kind"] == "group":
-            await bot.send_group_msg(group_id=target["group_id"], message=message)
-        else:
-            await bot.send_private_msg(user_id=target["user_id"], message=message)
+    if target["kind"] == "group":
+        await bot.send_group_msg(group_id=target["group_id"], message=message)
+    else:
+        await bot.send_private_msg(user_id=target["user_id"], message=message)
 
 
 pat_twitter = on_regex(r'(twitter\.com|x\.com)/[a-zA-Z0-9_]+/status/\d+',priority=plugin_config.command_priority)
@@ -555,14 +559,14 @@ async def pat_twitter_handle(bot: Bot,event: MessageEvent,matcher: Matcher,text:
         tmp = text.split("/")
         user_name = tmp[1]
         tweet_id = tmp[-1]
+        target = dict(bot_id=str(bot.self_id), user_id=int(event.user_id),
+                      message_id=int(event.message_id), kind="private")
+        if isinstance(event, GroupMessageEvent):
+            target.update(kind="group", group_id=int(event.group_id))
 
         if plugin_config.twitter_translation_enabled:
             if twitter_pipeline is None or twitter_manual_queue is None:
                 await matcher.finish("推文翻译服务尚未启动，请稍后重试。")
-            target = dict(bot_id=str(bot.self_id), user_id=int(event.user_id),
-                          message_id=int(event.message_id), kind="private")
-            if isinstance(event, GroupMessageEvent):
-                target.update(kind="group", group_id=int(event.group_id))
             twitter_manual_queue.enqueue(source_user_name=user_name, tweet_id=tweet_id, target=target)
             twitter_pipeline.wake.set()
             await matcher.finish("推文已加入翻译队列，完成后会发送图片。", reply_message=True)
@@ -573,18 +577,11 @@ async def pat_twitter_handle(bot: Bot,event: MessageEvent,matcher: Matcher,text:
             playwright,browser = await create_browser()
         
         tweet_info = await get_tweet(browser,user_name,tweet_id)
-        msg = await tweet_handle_link(tweet_info,user_name,tweet_id)
-        if plugin_config.twitter_node and all(segment.type == "node" for segment in msg):
-            if isinstance(event,GroupMessageEvent):
-                await bot.send_group_forward_msg(group_id=int(event.group_id), messages=msg)
-            else:
-                await bot.send_private_forward_msg(user_id=int(event.user_id), messages=msg)
-        else:
-            if any(segment.type == "video" for segment in msg):
-                for segment in msg:
-                    await matcher.send(segment, reply_message=True)
-            else:
-                await matcher.send(msg, reply_message=True)
+        if not tweet_info["status"] and not tweet_info.get("html"):
+            await matcher.finish(f"{user_name} 的推文 {tweet_id} 获取失败", reply_message=True)
+        prepared = await prepare_manual_tweet_delivery(tweet_info,user_name,tweet_id,{})
+        for part in prepared["delivery_parts"]:
+            await send_manual_tweet_part(target,part["mode"],part["message"])
     except FinishedException:
         pass            
     except Exception as e:

@@ -8,16 +8,19 @@ import logging
 from pathlib import Path
 from threading import RLock
 
+from .tweet_model import TweetView
+
 logger = logging.getLogger(__name__)
 PREFIX = "manual:"
 
 
 class ManualLinkQueue:
-    def __init__(self, path: Path, *, prepare_delivery, send_part):
+    def __init__(self, path: Path, *, prepare_delivery, send_part, prepare_photos=None):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.prepare_delivery = prepare_delivery
         self.send_part = send_part
+        self.prepare_photos = prepare_photos
         self.lock = RLock()
 
     @staticmethod
@@ -76,11 +79,28 @@ class ManualLinkQueue:
         request = self.read().get(user)
         if request is None:
             return True
+        if self.prepare_photos and not info.get("manual_delivery_version"):
+            # Older frozen deliveries omitted photos after a rendered preview. Add only
+            # those missing attachments, retaining existing images, GIFs and receipts.
+            if any(part["part"].startswith("image:") for part in info["delivery_parts"]):
+                processing = request["pending_tweets"][0]["processing"]
+                view = TweetView.from_dict(json.loads(Path(processing["view_cache"]).read_text("utf8")))
+                photos = await self.prepare_photos(view.legacy_fields()["pic_url_list"])
+                preview = [part for part in info["delivery_parts"] if part["part"].startswith("image:")]
+                attachments = [part for part in info["delivery_parts"] if not part["part"].startswith("image:")]
+                info["delivery_parts"] = [*preview, *photos, *attachments]
+            info["manual_delivery_version"] = 1
+            path = Path(request["pending_tweets"][0]["processing"]["delivery_cache"])
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(info, ensure_ascii=False), "utf8")
+            temporary.replace(path)
         for part in info["delivery_parts"]:
             if part["part"] in request.get("sent_parts", []):
                 continue
             try:
-                await self.send_part(request["target"], part["mode"], part["message"])
+                # Also apply the new reply policy to already frozen older messages.
+                mode = "reply" if part["part"].startswith("image:") or part["part"] == "original" else "direct"
+                await self.send_part(request["target"], mode, part["message"])
             except Exception as error:
                 logger.warning("手动推文 %s 投递失败：%s", tweet_id, type(error).__name__)
                 return False

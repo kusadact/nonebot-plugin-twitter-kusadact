@@ -1008,27 +1008,44 @@ def deserialize_message(segments: list[dict]) -> Message:
     return message
 
 
-async def prepare_tweet_delivery(info: dict, user: str, tweet_id: str, state: dict) -> dict:
+async def prepare_manual_photos(urls: list[str]) -> list[dict]:
+    parts = []
+    for index, url in enumerate(dict.fromkeys(urls)):
+        photo = await get_pic(url)
+        parts.append(dict(part=f"photo:{index}", mode="direct", message=serialize_message(Message(photo))))
+    return parts
+
+
+async def prepare_manual_tweet_delivery(info: dict, user: str, tweet_id: str, state: dict) -> dict:
+    return await prepare_tweet_delivery(info, user, tweet_id, state, manual=True)
+
+
+async def prepare_tweet_delivery(info: dict, user: str, tweet_id: str, state: dict, *, manual=False) -> dict:
     parts = []
     nickname = state.get(user, {}).get("screen_name", user)
     images = info.get("rendered_images", [])
     for index, path in enumerate(images):
         image = MessageSegment.image(Path(path).read_bytes())
-        if plugin_config.twitter_node:
+        if plugin_config.twitter_node and not manual:
             message = Message(MessageSegment.node_custom(user_id=plugin_config.twitter_qq, nickname=nickname, content=Message(image)))
             mode = "node"
         else:
-            message, mode = Message(image), "direct"
+            message, mode = Message(image), "reply" if manual else "direct"
         parts.append(dict(part=f"image:{index}", mode=mode, message=serialize_message(message)))
-    if not images:
+    if manual and not images and plugin_config.twitter_htmlmode and info.get("html"):
+        parts.append(dict(part="image:0", mode="reply", message=serialize_message(Message(MessageSegment.image(info["html"])))))
+    if not parts:
         # Rendering exhausted its attempts: retain the existing original-content capability.
         segments = [MessageSegment.text("\n\n".join(info.get("text", [])))] if info.get("text") else []
-        for url in info.get("pic_url_list", []):
-            segments.append(await get_pic(url))
-        if not segments and not info.get("video_url") and not info.get("gif_url_list"):
+        if not manual:
+            for url in info.get("pic_url_list", []):
+                segments.append(await get_pic(url))
+        if not segments and (manual or (not info.get("video_url") and not info.get("gif_url_list"))):
             segments.append(MessageSegment.text(f"https://x.com/{user}/status/{tweet_id}"))
         if segments:
-            parts.append(dict(part="original", mode="direct", message=serialize_message(Message(segments))))
+            parts.append(dict(part="original", mode="reply" if manual else "direct", message=serialize_message(Message(segments))))
+    if manual:
+        parts.extend(await prepare_manual_photos(info.get("pic_url_list", [])))
     pinned_files = []
     for index, url in enumerate(info.get("gif_url_list", [])):
         path = await get_gif_path(url)
@@ -1045,8 +1062,11 @@ async def prepare_tweet_delivery(info: dict, user: str, tweet_id: str, state: di
                 raise ValueError("video_prepare_failed")
             pinned_files.append(str(Path(path).resolve()))
             parts.append(dict(part=f"video:{index}", mode="video", message=serialize_message(Message(video))))
-    return dict(status=True, r18=info.get("r18", False), media=info.get("media", False),
-                html="", delivery_parts=parts, pinned_files=pinned_files)
+    prepared = dict(status=True, r18=info.get("r18", False), media=info.get("media", False),
+                    html="", delivery_parts=parts, pinned_files=pinned_files)
+    if manual:
+        prepared["manual_delivery_version"] = 1
+    return prepared
 
 
 async def tweet_handle(tweet_info: dict, user_name: str, line_new_tweet_id: str, twitter_list: dict) -> bool:
