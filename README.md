@@ -17,7 +17,7 @@ _✨ 推文订阅推送插件 ✨_
 <a href="https://pypi.python.org/pypi/nonebot-plugin-twitter">
     <img src="https://img.shields.io/pypi/v/nonebot-plugin-twitter.svg" alt="pypi">
 </a>
-<img src="https://img.shields.io/badge/python-3.8+-blue.svg" alt="python">
+<img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="python">
 
 </div>
 
@@ -25,7 +25,11 @@ _✨ 推文订阅推送插件 ✨_
 
 ## 📖 介绍
 
-订阅推送 twitter 推文
+订阅推送 Twitter 推文。支持主帖、引用、回复和投票的完整图片模板、按需简体中文翻译、GIF 附件、超长图片分片，以及持久推送队列和按回执补发。
+
+正式模板和自动翻译默认关闭。配置与重试规则见 [图片、翻译与投票说明](docs/translation.md)，线路配置格式见 [.env.example](.env.example)。翻译主力最多 10 次、保底最多 3 次；校验失败的下一次请求带错误反馈修正，次数仍计入原预算。
+
+运行环境需要 Python 3.10+、Playwright 可启动的 Chrome/Chromium、中文字体；发送 X 的 MP4 动图还需要 ffmpeg。投票保留原始选项、比例、票数和状态，选项随整帖翻译。
 
 ## 💿 安装
 
@@ -60,6 +64,19 @@ _✨ 推文订阅推送插件 ✨_
 
 </details>
 
+本仓库的 Git 版本可直接安装：
+
+```sh
+uv add "nonebot-plugin-twitter @ git+https://github.com/kusadact/nonebot-plugin-twitter-kusadact.git@master"
+```
+
+已使用该 Git 依赖的项目，更新时刷新该包的锁定提交，再同步环境：
+
+```sh
+uv lock --upgrade-package nonebot-plugin-twitter
+uv sync --inexact
+```
+
 ## ⚙️ 配置
 
  
@@ -72,6 +89,14 @@ _✨ 推文订阅推送插件 ✨_
 | twitter_qq | 否 | 2854196310 | 合并消息头像来源 |
 | command_priority | 否 | 10 | 命令优先级 |
 | twitter_htmlmode | 否 | false | 网页截图模式 |
+| twitter_template_enabled | 否 | false | 独立启用正式图片模板 |
+| twitter_translation_enabled | 否 | false | 自动订阅翻译并启用正式模板 |
+| twitter_translation_primary | 否 | 无 | 主力线路 JSON：url、key、model |
+| twitter_translation_fallback | 否 | 无 | 保底线路 JSON：url、key、model |
+| twitter_translation_timeout | 否 | 60 | 单次模型请求期限，秒，最大 300 |
+| twitter_translation_max_chars | 否 | 30000 | 完整输入和 Prompt 的字符预算 |
+| twitter_render_width | 否 | 640 | 正式图片宽度 |
+| twitter_render_max_height | 否 | 8000 | 单张图片高度上限，超长内容分片 |
 | twitter_original | 否 | false | 使用 X 官网截图 |
 | twitter_html_timezone | 否 | Asia/Shanghai | Nitter 截图时间显示时区 |
 | twitter_html_timezone_label | 否 | UTC+8 | Nitter 截图时间显示标签 |
@@ -160,6 +185,13 @@ r18 : 开启r18推文推送
 6.推文列表暂时仅在 网页截图模式 开启时支持
 
 ### 更新记录
+2026.10.13 0.3.0
+1. 正式图片模板完整展示主帖、引用、回复和投票，使用 SVG 图标并按内容高度分片。
+2. 主力/保底整帖翻译、校验反馈修正、持久重试和缓存，支持正常数字词翻译。
+3. 抓取每次最多 10 秒、最多 5 次；抓取解析后并行翻译与素材下载。
+4. 循环 GIF 附件与持久推送队列，失败仅补发未成功的目标和消息部分。
+5. 独立本地预览网页提供当前链路、Gemini、DeepSeek 三模式。
+
 2024.01.20 0.2.4
 1. 优化代理设置
 2. 添加链接识别功能

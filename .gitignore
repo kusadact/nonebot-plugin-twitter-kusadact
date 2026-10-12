@@ -178,3 +178,9 @@ pyrightconfig.json
 !.vscode/launch.json
 !.vscode/extensions.json
 !.vscode/*.code-snippets
+
+# Private preview routes and generated output
+.env.preview.json
+previews/generated/
+uv.lock
+.DS_Store

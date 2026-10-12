@@ -12,6 +12,7 @@ from typing import Optional,Literal
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import quote, unquote, urljoin, urlparse
+from uuid import uuid4
 from bs4 import BeautifulSoup
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import MessageSegment,Message
@@ -28,6 +29,11 @@ from .config import (
     nitter_foot,
     nitter_head,
 )
+from .nitter_parser import parse_nitter
+from .tweet_fetcher import fetch_nitter_view
+from .tweet_model import TweetView
+from .renderer import TweetRenderer
+from .gif_media import convert_gif, gif_cache_path
 from .timeline import (
     build_timeline_signature,
     get_new_timeline_entries,
@@ -232,10 +238,11 @@ async def get_user_timeline_entries(user_name: str) -> list[dict]:
         res = await client.get(url=f"{plugin_config.twitter_url}/{user_name}",headers=header)
         if res.status_code ==200:
             soup = BeautifulSoup(res.text,"html.parser")
+            if soup.select_one(".error-panel") or not soup.select_one(".profile-card-fullname"):
+                raise ValueError(f"{user_name} 的响应不是有效 Nitter 时间线")
             return parse_timeline_entries(soup, user_name)
-        else:
-            logger.warning(f"通过 user_name {user_name} 获取时间线失败：{res.status_code} {res.text}")
-            return []
+        res.raise_for_status()
+        raise ValueError(f"{user_name} 的时间线响应状态异常：{res.status_code}")
 
 
 async def get_user_timeline(user_name:str,since_id: str = "0"):
@@ -464,6 +471,25 @@ async def get_timeline_screen(browser: Browser,user_name: str,length: int = 5):
     finally:
         await close_page_context(page, context)
     
+def use_tweet_template() -> bool:
+    return bool(getattr(plugin_config, "twitter_template_enabled", False) or
+                getattr(plugin_config, "twitter_translation_enabled", False))
+
+
+def make_tweet_renderer() -> TweetRenderer:
+    return TweetRenderer(Path("data/twitter/cache/pipeline/rendering"), get_browser_launch_kwargs(),
+                         proxy=plugin_config.twitter_proxy,
+                         width=getattr(plugin_config, "twitter_render_width", 640),
+                         max_height=getattr(plugin_config, "twitter_render_max_height", 8000),
+                         timezone=getattr(plugin_config, "twitter_html_timezone", "Asia/Shanghai") or "Asia/Shanghai",
+                         label=getattr(plugin_config, "twitter_html_timezone_label", "UTC+8") or "UTC+8")
+
+
+async def fetch_tweet_view(user_name: str, tweet_id: str) -> TweetView:
+    return await fetch_nitter_view(plugin_config.twitter_url, user_name, tweet_id,
+                                   proxy=plugin_config.twitter_proxy, headers=header)
+
+
 async def get_tweet(browser: Browser,user_name:str,tweet_id: str = "0") -> dict:
     '''通过 user_name 和 tweet_id 获取推文详情,
     return:
@@ -474,6 +500,14 @@ async def get_tweet(browser: Browser,user_name:str,tweet_id: str = "0") -> dict:
     result["r18"]
     result["html"]
     '''
+    if use_tweet_template():
+        view = await fetch_tweet_view(user_name, tweet_id)
+        info = view.legacy_fields()
+        try:
+            info["rendered_images"] = await make_tweet_renderer().render(view)
+        except Exception as error:
+            logger.warning(f"推文 {user_name}/{tweet_id} 模板渲染失败：{type(error).__name__}")
+        return info
     try:
         result = {}
         result["status"] = False
@@ -511,52 +545,17 @@ async def get_tweet(browser: Browser,user_name:str,tweet_id: str = "0") -> dict:
                 await close_page_context(page, context)
 
         async with httpx.AsyncClient(**build_httpx_client_kwargs(http2=True, timeout=120)) as client:
-            res = await client.get(url,cookies={"hlsPlayback": "on"},headers=header)
+            res = await client.get(f"{plugin_config.twitter_url}/{user_name}/status/{tweet_id}",cookies={"hlsPlayback": "on"},headers=header)
             if res.status_code ==200:
                 soup = BeautifulSoup(res.text,"html.parser")
+                if soup.select_one(".error-panel") or not soup.select_one(".main-thread .main-tweet"):
+                    logger.warning(f"{user_name} 的推文 {tweet_id} 响应不是有效 Nitter 推文")
+                    return result
 
-                # text && pic && video
-                result["text"] = []
-                result["pic_url_list"] = []
-                result["video_url"] = ""
-                result["quote_text"] = ""
-                result["quote_user_name"] = ""
-                if main_thread_div := soup.find('div', class_='main-thread'):
-                    # pic
-                    if pic_list := main_thread_div.find_all('a', class_='still-image'): # type: ignore
-                        result["pic_url_list"] = [x.attrs["href"] for x in pic_list]
-                    # video
-                    if video_list := main_thread_div.find_all('video'): # type: ignore
-                        if video_url := video_list[0].attrs.get("data-url"):
-                            result["video_url"] = video_url
-                        else:
-                            try:
-                                video_url = video_list[0].parent.parent.parent.parent.parent.contents[1].attrs["href"].replace("#m","")
-                            except Exception as e:
-                                logger.info(f"获取视频推文链接出错，转为获取自身链接，{e}")
-                                video_url = url.split(plugin_config.twitter_url)[1]
-                            result["video_url"] = f"https://x.com{video_url}"
-                    # text
-                    if match := main_thread_div.find_all('div', class_='tweet-content media-body'): # type: ignore
-                        for x in match:
-                            if x.parent.attrs["class"] == "replying-to":
-                                continue
-                            result["text"].append(x.text)
-                    if quote_div := main_thread_div.find('div', class_='quote'): # type: ignore
-                        if quote_text := quote_div.find('div', class_='quote-text'):
-                            result["quote_text"] = quote_text.text.strip()
-                        if quote_user := quote_div.find('a', class_='username'):
-                            result["quote_user_name"] = quote_user.text.strip().lstrip("@")
-                        if result["quote_text"]:
-                            quote_prefix = "引用"
-                            if result["quote_user_name"]:
-                                quote_prefix = f"引用 @{result['quote_user_name']}"
-                            result["text"].append(f"{quote_prefix}：\n{result['quote_text']}")
-                # r18
-                result["r18"] = bool(r18 := soup.find_all('div', class_='unavailable-box'))
-                if result["video_url"] or result["pic_url_list"]:
-                    result["media"] = True
-                    logger.info(f"推主 {user_name} 的推文 {tweet_id} 存在媒体")
+                screenshot = result["html"]
+                view = parse_nitter(res.text, plugin_config.twitter_url, user_name, tweet_id)
+                result.update(view.legacy_fields())
+                result["html"] = screenshot
                 result["status"] = True
                 logger.info(f"推主 {user_name} 的推文 {tweet_id} 获取成功")
             else:
@@ -570,7 +569,7 @@ async def get_tweet(browser: Browser,user_name:str,tweet_id: str = "0") -> dict:
 async def get_video_path(url: str) -> list:
     try:
         async def download_video_file(client: httpx.AsyncClient, download_url: str, *, extra_headers: Optional[dict] = None) -> list[str]:
-            filename = f"{int(datetime.now().timestamp())}.mp4"
+            filename = f"{int(datetime.now().timestamp())}.{uuid4().hex}.mp4"
             path = Path() / "data" / "twitter" / "cache" / filename
             abs_path = f"{os.getcwd()}/{str(path)}"
 
@@ -605,6 +604,12 @@ async def get_video_path(url: str) -> list:
         def extract_direct_video_url(raw_url: str) -> str:
             parsed = urlparse(raw_url)
             path = parsed.path if parsed.scheme else raw_url
+            if path.startswith("/pic/"):
+                decoded = unquote(path.removeprefix("/pic/"))
+                if decoded.startswith("video.twimg.com/"):
+                    return "https://" + decoded
+                if decoded.startswith(("https://video.twimg.com/", "http://video.twimg.com/")):
+                    return decoded
             if not path.startswith("/video/"):
                 return raw_url
 
@@ -657,7 +662,7 @@ async def get_video_path(url: str) -> list:
             if not init_url or not segment_urls:
                 raise ValueError("未找到可下载的视频分片")
 
-            filename = f"{int(datetime.now().timestamp())}.mp4"
+            filename = f"{int(datetime.now().timestamp())}.{uuid4().hex}.mp4"
             path = Path() / "data" / "twitter" / "cache" / filename
             abs_path = f"{os.getcwd()}/{str(path)}"
 
@@ -691,7 +696,7 @@ async def get_video_path(url: str) -> list:
             if direct_url == master_url and not urlparse(direct_url).netloc.endswith("video.twimg.com"):
                 raise ValueError("未找到可直连的 video.twimg.com 视频地址")
 
-            filename = f"{int(datetime.now().timestamp())}.mp4"
+            filename = f"{int(datetime.now().timestamp())}.{uuid4().hex}.mp4"
             path = Path() / "data" / "twitter" / "cache" / filename
             abs_path = f"{os.getcwd()}/{str(path)}"
             cmd = [
@@ -732,6 +737,8 @@ async def get_video_path(url: str) -> list:
             return [abs_path]
 
         async with httpx.AsyncClient(**build_httpx_client_kwargs(timeout=120)) as client:
+            if urlparse(extract_direct_video_url(url)).path.lower().endswith(".mp4"):
+                return await download_video_file(client, extract_direct_video_url(url))
             if "/video/" in url:
                 try:
                     return await download_direct_hls_video(url)
@@ -772,7 +779,7 @@ async def get_video_path(url: str) -> list:
 
             download_files = []
             for video_url in video_urls:
-                filename = str(int(datetime.now().timestamp())) + ".mp4"
+                filename = f"{int(datetime.now().timestamp())}.{uuid4().hex}.mp4"
                 path = Path() / "data" / "twitter" / "cache" /  filename
                 path = f"{os.getcwd()}/{str(path)}"
                 async with client.stream("GET", video_url) as response:
@@ -788,6 +795,17 @@ async def get_video_path(url: str) -> list:
     except Exception as e:
         logger.warning(f"下载视频异常：url {url}，{e}")
         raise e
+
+async def get_gif_path(url: str) -> str:
+    target = gif_cache_path(url, Path("data/twitter/cache/pipeline/gifs")).resolve()
+    if target.is_file() and target.read_bytes()[:6] in {b"GIF87a", b"GIF89a"}:
+        return str(target)
+    files = await get_video_path(url)
+    if not files:
+        raise ValueError("gif_download_empty")
+    await convert_gif(Path(files[0]), target)
+    return str(target)
+
 
 async def get_video(file_path: str) -> MessageSegment:
     '修改为返回视频消息，而非合并视频消息'
@@ -849,55 +867,55 @@ async def get_pic(url: str) -> MessageSegment:
 
 
 # 发送
-async def send_msg(twitter_list: dict,user_name: str,line_new_tweet_id: str,tweet_info: dict,msg: Message,mode:Optional[Literal["node","direct","video"]] = "node"):
-    for group_num in twitter_list[user_name]["group"]:
-        # 群聊
-        if twitter_list[user_name]["group"][group_num]["status"]:
-            if twitter_list[user_name]["group"][group_num]["r18"] == False and tweet_info["r18"] == True:
-                logger.info(f"根据r18设置，群 {group_num} 的推文 {user_name}/status/{line_new_tweet_id} 跳过发送")
+async def send_msg(
+    twitter_list: dict, user_name: str, line_new_tweet_id: str, tweet_info: dict,
+    msg: Message, mode: Optional[Literal["node", "direct", "video"]] = "node", *, part: str = "main",
+) -> bool:
+    if mode not in {"node", "direct", "video"}:
+        raise ValueError(f"未知发送模式：{mode}")
+    success = True
+    user = read_twitter_list().get(user_name, {})
+    for kind in ("group", "private"):
+        for recipient, settings in user.get(kind, {}).items():
+            if not settings.get("status", False):
                 continue
-            if twitter_list[user_name]["group"][group_num]["media"] == True and tweet_info["media"] == False:
-                logger.info(f"根据媒体设置，群 {group_num} 的推文 {user_name}/status/{line_new_tweet_id} 跳过发送")
+            if not settings.get("r18", False) and tweet_info.get("r18", False):
                 continue
-            try:
-                if mode == "node":
-                    # 以合并方式发送
-                    if await tools.send_group_forward_msg_by_bots(group_id=int(group_num), node_msg=msg):
-                        logger.info(f"群 {group_num} 的推文 {user_name}/status/{line_new_tweet_id} 合并发送成功")
-                elif mode == "direct":
-                    if await tools.send_group_msg_by_bots(group_id=int(group_num), msg=msg):
-                        logger.info(f"群 {group_num} 的推文 {user_name}/status/{line_new_tweet_id} 直接发送成功")
-                elif mode == "video":
-                    if await tools.send_group_msg_by_bots(group_id=int(group_num), msg=msg):
-                        logger.info(f"群 {group_num} 的推文 {user_name}/status/{line_new_tweet_id} 视频发送成功")
-            except Exception as e:
-                logger.warning(f"发送消息出现失败,目标群：{group_num},推文 {user_name}/status/{line_new_tweet_id}，发送模式 {'截图' if tweet_info['html'] else '内容'}，异常{e}")
-        else:
-            logger.info(f"根据通知设置，群 {group_num} 的推文 {user_name}/status/{line_new_tweet_id} 跳过发送")
-            
-    for qq in twitter_list[user_name]["private"]:
-        # 私聊
-        if twitter_list[user_name]["private"][qq]["status"]:
-            if twitter_list[user_name]["private"][qq]["r18"] == False and tweet_info["r18"] == True:
-                logger.info(f"根据r18设置，qq {qq} 的推文 {user_name}/status/{line_new_tweet_id} 跳过发送")   
+            if settings.get("media", False) and not tweet_info.get("media", False):
                 continue
-            if twitter_list[user_name]["private"][qq]["media"] == True and tweet_info["media"] == False:
-                logger.info(f"根据媒体设置，qq {qq} 的推文 {user_name}/status/{line_new_tweet_id} 跳过发送")   
+            target = f"{kind}:{recipient}"
+            receipts = read_twitter_list().get(user_name, {}).get("pending_deliveries", {})
+            if part in receipts.get(str(line_new_tweet_id), {}).get(target, []):
                 continue
             try:
-                if mode == "node":
-                    if await tools.send_private_forward_msg_by_bots(user_id=int(qq), node_msg=msg):
-                        logger.info(f"qq {qq} 的推文 {user_name}/status/{line_new_tweet_id} 合并发送成功")
-                elif mode == "direct":
-                    if await tools.send_private_msg_by_bots(user_id=int(qq), msg=msg):
-                        logger.info(f"qq {qq} 的推文 {user_name}/status/{line_new_tweet_id} 直接发送成功")
-                elif mode == "video":
-                    if await tools.send_private_msg_by_bots(user_id=int(qq), msg=msg):
-                        logger.info(f"qq {qq} 的推文 {user_name}/status/{line_new_tweet_id} 视频发送成功")
+                if kind == "group":
+                    if mode == "node":
+                        sent = await tools.send_group_forward_msg_by_bots(group_id=int(recipient), node_msg=msg)
+                    else:
+                        sent = await tools.send_group_msg_by_bots(group_id=int(recipient), msg=msg)
+                elif mode == "node":
+                    sent = await tools.send_private_forward_msg_by_bots(user_id=int(recipient), node_msg=msg)
+                else:
+                    sent = await tools.send_private_msg_by_bots(user_id=int(recipient), msg=msg)
+                if not sent:
+                    success = False
+                    logger.warning(f"推文 {user_name}/status/{line_new_tweet_id} 未发送到 {target}")
+                    continue
+
+                def remember(state):
+                    if user_name not in state:
+                        return
+                    pending = state[user_name].setdefault("pending_deliveries", {})
+                    completed = pending.setdefault(str(line_new_tweet_id), {}).setdefault(target, [])
+                    if part not in completed:
+                        completed.append(part)
+
+                update_twitter_list(remember)
+                logger.info(f"推文 {user_name}/status/{line_new_tweet_id} 发送到 {target} 成功")
             except Exception as e:
-                logger.warning(f"发送消息出现失败,目标qq：{qq},推文 {user_name}/status/{line_new_tweet_id}，发送模式 {'截图' if tweet_info['html'] else '内容'}，异常{e}")
-        else:
-            logger.info(f"根据通知设置，qq {qq} 的推文 {user_name}/status/{line_new_tweet_id} 跳过发送")                    
+                success = False
+                logger.warning(f"推文 {user_name}/status/{line_new_tweet_id} 发送到 {target} 失败：{e}")
+    return success
 
 def get_next_element(my_list, current_element):
 
@@ -915,17 +933,22 @@ async def get_tweet_context(tweet_info: dict,user_name: str,line_new_tweet_id: s
     all_msg = []
         
     # html模式
-    if plugin_config.twitter_htmlmode:
-        bytes_size = sys.getsizeof(tweet_info["html"]) / (1024 * 1024)
+    if tweet_info.get("rendered_images"):
+        all_msg.extend(MessageSegment.image(Path(path).read_bytes()) for path in tweet_info["rendered_images"])
+    elif plugin_config.twitter_htmlmode and tweet_info.get("html"):
         all_msg.append(MessageSegment.image(tweet_info["html"]))
     
     # 返回图片
-    if tweet_info["pic_url_list"]:
+    if tweet_info["pic_url_list"] and not tweet_info.get("rendered_images"):
         for url in tweet_info["pic_url_list"]:
             # print(f"打印图片链接: {url}")
             # if ".jpg" in url:
             #     url = url.replace(".jpg")
             all_msg.append(await get_pic(url))
+
+    for url in tweet_info.get("gif_url_list", []):
+        path = await get_gif_path(url)
+        all_msg.append(MessageSegment.image(Path(path).read_bytes()))
             
     # 视频，返回本地视频路径
     if tweet_info["video_url"]:
@@ -965,144 +988,132 @@ def split_nitter_preview_messages(
     return [], media_msgs
 
 
-async def tweet_handle(tweet_info: dict,user_name: str,line_new_tweet_id: str,twitter_list: dict) -> bool:
-    if not tweet_info["status"] and not tweet_info["html"]:
-        # 啥都没获取到
-        logger.warning(f"{user_name} 的推文 {line_new_tweet_id} 获取失败")
-        return False
-    elif not tweet_info["status"] and tweet_info["html"]:
-        # 起码有个截图
-        logger.debug(f"{user_name} 的推文 {line_new_tweet_id} 获取失败，但截图成功，准备发送截图")
-        msg = []
-        if plugin_config.twitter_htmlmode:
-            # 有截图
-            bytes_size = sys.getsizeof(tweet_info["html"]) / (1024 * 1024)
-            msg.append(MessageSegment.image(tweet_info["html"]))
-            if plugin_config.twitter_node:
-                # 合并转发
-                msg.append(MessageSegment.node_custom(
-                    user_id=plugin_config.twitter_qq,
-                    nickname=twitter_list[user_name]["screen_name"],
-                    content=Message(MessageSegment.image(tweet_info["html"]))
-                ))
-                await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(msg))
-            else:
-                # 直接发送
-                await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(msg),"direct")
-                
-            return True
-        return False
-    # elif tweet_info["status"] and not tweet_info["html"]:
-    #     # 只没有截图？不应该啊
-    #     pass
-    # elif tweet_info["status"] and tweet_info["html"]:
-    else:
-        # 有没有截图不知道，内容信息是真有
-        all_msg = await get_tweet_context(tweet_info,user_name,line_new_tweet_id)
-        has_text = bool(tweet_info["text"]) and not plugin_config.twitter_no_text
-        media_msgs, video_msgs = split_video_messages(all_msg)
-        prefer_nitter_first = should_send_nitter_first(tweet_info)
-        nitter_msgs, content_media_msgs = split_nitter_preview_messages(tweet_info, media_msgs)
-            
-        # 准备发送消息
-        if plugin_config.twitter_node and not video_msgs:
-            # 以合并方式发送
-            msg = []
-            ordered_media_msgs = media_msgs
-            if prefer_nitter_first:
-                ordered_media_msgs = [*nitter_msgs, *content_media_msgs]
-                for value in nitter_msgs:
-                    msg.append(
-                        MessageSegment.node_custom(
-                            user_id=plugin_config.twitter_qq,
-                            nickname=twitter_list[user_name]["screen_name"],
-                            content=Message(value)
-                        )
-                    )
-            if has_text:
-                # 开启了媒体文字
-                for x in tweet_info["text"]:
-                    msg.append(MessageSegment.node_custom(
-                        user_id=plugin_config.twitter_qq,
-                        nickname=twitter_list[user_name]["screen_name"],
-                        content=
-                        Message(x)
-                    ))
-            for value in ordered_media_msgs[len(nitter_msgs):] if prefer_nitter_first else ordered_media_msgs:
-                msg.append(
-                    MessageSegment.node_custom(
-                        user_id=plugin_config.twitter_qq,
-                        nickname=twitter_list[user_name]["screen_name"],
-                        content=Message(value)
-                    )
-                )
-            if msg:
-                # 发送合并消息
-                await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(msg))
-            else:
-                logger.info(f"推文 {user_name}/status/{line_new_tweet_id} 根据配置过滤后无可发送内容")
-        else:
-            if video_msgs:
-                # 合并转发不稳定支持视频，视频推文改为拆开发送
-                if prefer_nitter_first and nitter_msgs:
-                    await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(nitter_msgs),"direct")
-                if has_text:
-                    await send_msg(
-                        twitter_list,
-                        user_name,
-                        line_new_tweet_id,
-                        tweet_info,
-                        Message(MessageSegment.text('\n\n'.join(tweet_info["text"]))),
-                        "direct",
-                    )
-                media_to_send = content_media_msgs if prefer_nitter_first else media_msgs
-                if media_to_send:
-                    await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(media_to_send),"direct")
-                for video_msg in video_msgs:
-                    await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(video_msg),"video")
-            else:
-                # 以直接发送的方式
-                if prefer_nitter_first:
-                    if nitter_msgs:
-                        await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(nitter_msgs),"direct")
-                    if has_text:
-                        await send_msg(
-                            twitter_list,
-                            user_name,
-                            line_new_tweet_id,
-                            tweet_info,
-                            Message(MessageSegment.text('\n\n'.join(tweet_info["text"]))),
-                            "direct",
-                        )
-                    if content_media_msgs:
-                        await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(content_media_msgs),"direct")
-                    if not nitter_msgs and not has_text and not content_media_msgs:
-                        logger.info(f"推文 {user_name}/status/{line_new_tweet_id} 根据配置过滤后无可发送内容")
-                else:
-                    if has_text:
-                        # 开启了媒体文字
-                        media_msgs.insert(0, MessageSegment.text('\n\n'.join(tweet_info["text"])))
-                    if media_msgs:
-                        # 剩余部分直接发送
-                        await send_msg(twitter_list,user_name,line_new_tweet_id,tweet_info,Message(media_msgs),"direct")
-                    else:
-                        logger.info(f"推文 {user_name}/status/{line_new_tweet_id} 根据配置过滤后无可发送内容")
-            
-            
-        # 更新本地缓存
-        def persist_since_id(latest_twitter_list: dict):
-            if user_name not in latest_twitter_list:
-                return
-            current_since_id = str(latest_twitter_list[user_name].get("since_id", "0"))
-            try:
-                latest_twitter_list[user_name]["since_id"] = str(max(int(current_since_id), int(line_new_tweet_id)))
-            except Exception:
-                latest_twitter_list[user_name]["since_id"] = current_since_id
+def serialize_message(value):
+    if isinstance(value, MessageSegment):
+        return {"type": value.type, "data": serialize_message(value.data)}
+    if isinstance(value, dict):
+        return {key: serialize_message(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, Message)):
+        return [serialize_message(item) for item in value]
+    return value
 
-        update_twitter_list(persist_since_id)
-        return True
-    
-    
+
+def deserialize_message(segments: list[dict]) -> Message:
+    message = Message()
+    for segment in segments:
+        data = dict(segment["data"])
+        if segment["type"] == "node" and isinstance(data.get("content"), list):
+            data["content"] = deserialize_message(data["content"])
+        message.append(MessageSegment(segment["type"], data))
+    return message
+
+
+async def prepare_tweet_delivery(info: dict, user: str, tweet_id: str, state: dict) -> dict:
+    parts = []
+    nickname = state.get(user, {}).get("screen_name", user)
+    images = info.get("rendered_images", [])
+    for index, path in enumerate(images):
+        image = MessageSegment.image(Path(path).read_bytes())
+        if plugin_config.twitter_node:
+            message = Message(MessageSegment.node_custom(user_id=plugin_config.twitter_qq, nickname=nickname, content=Message(image)))
+            mode = "node"
+        else:
+            message, mode = Message(image), "direct"
+        parts.append(dict(part=f"image:{index}", mode=mode, message=serialize_message(message)))
+    if not images:
+        # Rendering exhausted its attempts: retain the existing original-content capability.
+        segments = [MessageSegment.text("\n\n".join(info.get("text", [])))] if info.get("text") else []
+        for url in info.get("pic_url_list", []):
+            segments.append(await get_pic(url))
+        if not segments and not info.get("video_url") and not info.get("gif_url_list"):
+            segments.append(MessageSegment.text(f"https://x.com/{user}/status/{tweet_id}"))
+        if segments:
+            parts.append(dict(part="original", mode="direct", message=serialize_message(Message(segments))))
+    pinned_files = []
+    for index, url in enumerate(info.get("gif_url_list", [])):
+        path = await get_gif_path(url)
+        pinned_files.append(str(Path(path).resolve()))
+        gif = MessageSegment.image(Path(path).read_bytes())
+        parts.append(dict(part=f"gif:{index}", mode="direct", message=serialize_message(Message(gif))))
+    if info.get("video_url"):
+        files = await get_video_path(info["video_url"])
+        if not files:
+            raise ValueError("video_download_empty")
+        for index, path in enumerate(files):
+            video = await get_video(path)
+            if video.type != "video":
+                raise ValueError("video_prepare_failed")
+            pinned_files.append(str(Path(path).resolve()))
+            parts.append(dict(part=f"video:{index}", mode="video", message=serialize_message(Message(video))))
+    return dict(status=True, r18=info.get("r18", False), media=info.get("media", False),
+                html="", delivery_parts=parts, pinned_files=pinned_files)
+
+
+async def tweet_handle(tweet_info: dict, user_name: str, line_new_tweet_id: str, twitter_list: dict) -> bool:
+    if "delivery_parts" in tweet_info or tweet_info.get("rendered_images") or tweet_info.get("gif_url_list"):
+        if "delivery_parts" not in tweet_info:
+            tweet_info = await prepare_tweet_delivery(tweet_info, user_name, line_new_tweet_id, twitter_list)
+        success = True
+        for part in tweet_info["delivery_parts"]:
+            success = await send_msg(twitter_list, user_name, line_new_tweet_id, tweet_info,
+                                     deserialize_message(part["message"]), part["mode"], part=part["part"]) and success
+        return success
+    if not tweet_info["status"]:
+        if not tweet_info["html"] or not plugin_config.twitter_htmlmode:
+            logger.warning(f"{user_name} 的推文 {line_new_tweet_id} 获取失败")
+            return False
+        image = MessageSegment.image(tweet_info["html"])
+        if plugin_config.twitter_node:
+            msg = Message(MessageSegment.node_custom(
+                user_id=plugin_config.twitter_qq,
+                nickname=twitter_list[user_name]["screen_name"], content=Message(image),
+            ))
+            mode = "node"
+        else:
+            msg, mode = Message(image), "direct"
+        return await send_msg(twitter_list, user_name, line_new_tweet_id, tweet_info, msg, mode, part="fallback")
+
+    all_msg = await get_tweet_context(tweet_info, user_name, line_new_tweet_id)
+    has_text = bool(tweet_info["text"]) and not plugin_config.twitter_no_text and not tweet_info.get("rendered_images")
+    media_msgs, video_msgs = split_video_messages(all_msg)
+    prefer_nitter_first = should_send_nitter_first(tweet_info)
+    nitter_msgs, content_media_msgs = split_nitter_preview_messages(tweet_info, media_msgs)
+    parts = []
+    if plugin_config.twitter_node and not video_msgs:
+        text_msgs = [MessageSegment.text(text) for text in tweet_info["text"]] if has_text else []
+        ordered = (
+            [*nitter_msgs, *text_msgs, *content_media_msgs] if prefer_nitter_first else
+            [*text_msgs, *media_msgs]
+        )
+        if ordered:
+            nodes = [MessageSegment.node_custom(
+                user_id=plugin_config.twitter_qq,
+                nickname=twitter_list[user_name]["screen_name"], content=Message(segment),
+            ) for segment in ordered]
+            parts.append(("node", "node", Message(nodes)))
+    elif video_msgs or prefer_nitter_first:
+        if prefer_nitter_first and nitter_msgs:
+            parts.append(("preview", "direct", Message(nitter_msgs)))
+        if has_text:
+            parts.append(("text", "direct", Message(MessageSegment.text('\n\n'.join(tweet_info["text"])))))
+        media = content_media_msgs if prefer_nitter_first else media_msgs
+        if media:
+            parts.append(("media", "direct", Message(media)))
+        for index, video in enumerate(video_msgs):
+            parts.append((f"video:{index}", "video", Message(video)))
+    else:
+        if has_text:
+            media_msgs.insert(0, MessageSegment.text('\n\n'.join(tweet_info["text"])))
+        if media_msgs:
+            parts.append(("direct", "direct", Message(media_msgs)))
+
+    success = True
+    for part, mode, msg in parts:
+        success = await send_msg(
+            twitter_list, user_name, line_new_tweet_id, tweet_info, msg, mode, part=part,
+        ) and success
+    return success
+
 async def tweet_handle_link(tweet_info: dict,user_name: str,line_new_tweet_id: str):
     if not tweet_info["status"] and not tweet_info["html"]:
         # 啥都没获取到
@@ -1134,7 +1145,7 @@ async def tweet_handle_link(tweet_info: dict,user_name: str,line_new_tweet_id: s
     else:
         # 有没有截图不知道，内容信息是真有
         all_msg = await get_tweet_context(tweet_info,user_name,line_new_tweet_id)
-        has_text = bool(tweet_info["text"]) and not plugin_config.twitter_no_text
+        has_text = bool(tweet_info["text"]) and not plugin_config.twitter_no_text and not tweet_info.get("rendered_images")
         media_msgs, video_msgs = split_video_messages(all_msg)
         prefer_nitter_first = should_send_nitter_first(tweet_info)
         nitter_msgs, content_media_msgs = split_nitter_preview_messages(tweet_info, media_msgs)

@@ -28,6 +28,9 @@ from .config import (
 )
 from .api import *
 from .timeline import get_new_timeline_entries, get_recent_timeline_signatures
+from .delivery import process_timeline
+from .pipeline import TweetPipeline
+from .translation import Translator
 
 
 __plugin_meta__ = PluginMetadata(
@@ -60,6 +63,8 @@ web_list = []
 last_nitter_sync_alert_token = None
 twitter_url_lock = asyncio.Lock()
 twitter_status_timeout_seconds = 180
+twitter_pipeline = None
+twitter_pipeline_task = None
 
 
 def normalize_website_url(url: str) -> str:
@@ -110,12 +115,12 @@ def build_nitter_sync_alert_message(status: dict) -> str:
     for account in accounts:
         if not isinstance(account, dict):
             continue
-        if account.get("chrome_logged_in", False):
+        if not account.get("needs_relogin", False):
             continue
         label = account.get("label") or account.get("id") or "unknown"
         invalid_accounts.append(str(label))
 
-    parts = ["推特镜像会话同步告警", "Chrome 里的 X 账号登录态失效，需要重新登录。"]
+    parts = ["推特镜像会话同步告警", "Chrome 里的 X 账号需要重新登录或完成验证。"]
     if invalid_accounts:
         parts.append(f"失效账号：{', '.join(invalid_accounts)}")
     if message := status.get("message"):
@@ -199,6 +204,36 @@ if hasattr(get_driver, "server_app"):
 @get_driver.on_startup
 async def pywt_init():
     asyncio.create_task(ensure_twitter_url())
+    global twitter_pipeline, twitter_pipeline_task
+    if plugin_config.plugin_enabled:
+        async def fetch_for_pipeline(user_name, tweet_id):
+            if not await ensure_twitter_url():
+                raise ValueError("nitter_unavailable")
+            return await fetch_tweet_view(user_name, tweet_id)
+
+        renderer = make_tweet_renderer()
+        twitter_pipeline = TweetPipeline(
+            read_state=read_twitter_list, update_state=update_twitter_list,
+            fetch=fetch_for_pipeline, render=renderer.render,
+            translator=Translator(Path("data/twitter/cache/pipeline/translations"),
+                                  timeout=plugin_config.twitter_translation_timeout,
+                                  max_chars=plugin_config.twitter_translation_max_chars,
+                                  proxy=plugin_config.twitter_proxy),
+            prepare=prepare_tweet_delivery, deliver=tweet_handle, config=plugin_config,
+            cache_dir=Path("data/twitter/cache/pipeline/tasks"),
+            prepare_assets=renderer.prepare_assets,
+        )
+        twitter_pipeline_task = asyncio.create_task(twitter_pipeline.run(), name="twitter-pipeline")
+
+
+@get_driver.on_shutdown
+async def stop_twitter_pipeline():
+    if twitter_pipeline_task is not None:
+        twitter_pipeline_task.cancel()
+        try:
+            await twitter_pipeline_task
+        except asyncio.CancelledError:
+            pass
         
 async def create_browser():
     try:
@@ -230,7 +265,19 @@ def clean_pic_cache():
     path = Path() / "data" / "twitter" / "cache"
     filenames = [f for f in os.listdir(path) if os.path.isfile(os.path.join(path,f))]
     timeline = int(datetime.now().timestamp()) - 60 * 60 * 5
-    [os.remove(path / f) for f in filenames if int(f.split(".")[0]) <= timeline]
+    pinned = set()
+    for user in read_twitter_list().values():
+        for entry in user.get("pending_tweets", []):
+            delivery_cache = entry.get("processing", {}).get("delivery_cache")
+            if delivery_cache:
+                try:
+                    pinned.update(json.loads(Path(delivery_cache).read_text()).get("pinned_files", []))
+                except (OSError, ValueError):
+                    pass
+    for filename in filenames:
+        stem = filename.split(".")[0]
+        if stem.isdigit() and int(stem) <= timeline and str((path / filename).resolve()) not in pinned:
+            (path / filename).unlink(missing_ok=True)
 
 
 if plugin_config.plugin_enabled and plugin_config.twitter_nitter_alert_qq and plugin_config.twitter_nitter_sync_status_file:
@@ -265,7 +312,8 @@ if plugin_config.plugin_enabled:
         playwright = None
         browser = None
         try:
-            playwright, browser = await create_browser()
+            if not use_tweet_template():
+                playwright, browser = await create_browser()
             twitter_list = read_twitter_list()
             results = []
             for user_name in twitter_list:
@@ -293,43 +341,15 @@ if plugin_config.plugin_enabled:
             await close_browser_resources(playwright, browser)
                 
 async def get_status(user_name,twitter_list,browser:Browser) -> bool:
-    # 获取推文
     try:
         timeline_entries = await get_user_timeline_entries(user_name)
-        timeline_seen = twitter_list[user_name].get("timeline_seen", [])
-        current_signatures = get_recent_timeline_signatures(timeline_entries)
-
-        if not current_signatures:
-            return True
-
-        if not timeline_seen:
-            def init_timeline_seen(latest_twitter_list: dict):
-                if user_name not in latest_twitter_list:
-                    return
-                latest_twitter_list[user_name]["timeline_seen"] = current_signatures
-
-            update_twitter_list(init_timeline_seen)
-            logger.info(f"初始化 {user_name} 的时间线游标")
-            return True
-
-        new_entries = get_new_timeline_entries(timeline_entries, timeline_seen)
-        result = True
-
-        for entry in new_entries:
-            tweet_info = await get_tweet(browser, entry["source_user_name"], entry["tweet_id"])
-            if entry["is_retweet"]:
-                tweet_info["is_retweet"] = True
-                retweet_text = f"@{user_name} 转帖了 @{entry['source_user_name']}"
-                tweet_info["text"] = [retweet_text, *tweet_info.get("text", [])]
-            result = await tweet_handle(tweet_info, user_name, entry["tweet_id"], twitter_list) and result
-
-        def persist_timeline_seen(latest_twitter_list: dict):
-            if user_name not in latest_twitter_list:
-                return
-            latest_twitter_list[user_name]["timeline_seen"] = current_signatures
-
-        update_twitter_list(persist_timeline_seen)
-        return result
+        queued_background = any("processing" in entry for entry in read_twitter_list().get(user_name, {}).get("pending_tweets", []))
+        return await process_timeline(
+            user_name, timeline_entries, browser,
+            read_state=read_twitter_list, update_state=update_twitter_list,
+            fetch_tweet=get_tweet, deliver_tweet=tweet_handle,
+            enqueue_only=use_tweet_template() or queued_background,
+        )
     except Exception as e:
         logger.debug(f"获取 {user_name} 的推文出现异常：{e}")
         return False
@@ -366,12 +386,9 @@ async def save_handle(bot:Bot,event: MessageEvent,matcher: Matcher,arg: Message 
         else:
             user_entry["private"][str(event.user_id)] = subscription
 
-        current_since_id = str(user_entry.get("since_id", "0"))
-        try:
-            user_entry["since_id"] = str(max(int(current_since_id), int(tweet_id)))
-        except Exception:
+        if "timeline_seen" not in user_entry and not user_entry.get("pending_tweets"):
             user_entry["since_id"] = tweet_id
-        user_entry["timeline_seen"] = timeline_seen
+            user_entry["timeline_seen"] = timeline_seen
         user_entry["screen_name"] = user_info["screen_name"]
 
     update_twitter_list(save_subscription)

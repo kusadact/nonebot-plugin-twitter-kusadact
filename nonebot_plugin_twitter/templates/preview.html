@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>推文图片测试</title>
+  <style>
+    :root {color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;}
+    * {box-sizing: border-box;}
+    body {margin: 0; background: #101214; color: #e9edf0; line-height: 1.55;}
+    main {max-width: 960px; margin: 56px auto; padding: 0 24px;}
+    h1 {font-size: 30px; margin: 0 0 8px; letter-spacing: -.5px;}
+    .muted {color: #929ca5; margin: 0 0 26px;}
+    .panel {background: #191d21; border: 1px solid #30363d; border-radius: 16px; padding: 24px;}
+    label {display: block; font-size: 14px; margin-bottom: 8px;}
+    .input-row {display: flex; gap: 12px;}
+    input[type=url] {flex: 1; min-width: 0; background: #101214; border: 1px solid #46515b; border-radius: 9px; padding: 12px; color: #f4f7f9; font: inherit;}
+    input:focus, select:focus {outline: 2px solid #8ac9ee; outline-offset: 2px;}
+    .mode {margin-top: 20px;}
+    select {width: 100%; background: #101214; border: 1px solid #46515b; border-radius: 9px; padding: 12px; color: #f4f7f9; font: inherit;}
+    #mode-detail {font-size: 13px; color: #aeb8c1; margin: 8px 0 0; overflow-wrap: anywhere;}
+    button, .download {border: 0; border-radius: 9px; padding: 12px 20px; font: inherit; font-weight: 600; cursor: pointer; background: #b6e3ff; color: #123047; text-decoration: none;}
+    button:disabled {opacity: .5; cursor: wait;}
+    .settings {display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-top: 16px; color: #aeb8c1; font-size: 13px;}
+    .settings label {display: flex; gap: 8px; align-items: center; margin: 0; font-size: 14px;}
+    #notice {margin: 18px 0 0; color: #ffb2a5; white-space: pre-wrap;}
+    #progress {margin: 24px 0; background: #191d21; border: 1px solid #30363d; padding: 20px 24px; border-radius: 14px;}
+    #status {font-weight: 600; margin: 0 0 4px;}
+    #detail {color: #aeb8c1; font-size: 14px; margin: 0; overflow-wrap: anywhere;}
+    .steps {display: flex; gap: 12px; margin-top: 16px; flex-wrap: wrap; font-size: 13px;}
+    .steps span {padding: 6px 12px; border-radius: 20px; background: #101214; color: #77838e;}
+    .steps span.active {background: #263e50; color: #c2e8ff;}
+    .steps span.done {background: #20372d; color: #a5e3c4;}
+    #results {display: grid; gap: 24px;}
+    .result {margin: 0;}
+    .result img {display: block; width: auto; max-width: 100%; height: auto; border-radius: 12px; border: 1px solid #30363d;}
+    .result figcaption {display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 12px;}
+    .download {font-size: 13px; padding: 8px 14px;}
+    a {color: #b6e3ff;}
+    #data-links {margin: 20px 0; display: flex; flex-wrap: wrap; gap: 20px; font-size: 13px;}
+    .foot {color: #77838e; font-size: 13px; margin-top: 24px;}
+    [hidden] {display: none !important;}
+    @media (max-width: 600px) {main {margin-top: 28px; padding: 0 16px;} .panel {padding: 20px;} .input-row {flex-direction: column;} h1 {font-size: 26px;}}
+  </style>
+</head>
+<body>
+<main>
+  <h1>推文图片测试</h1>
+  <p class="muted">粘贴推文链接，查看完整的原文、译文、引用、回复和媒体图片。</p>
+  <form id="form" class="panel">
+    <label for="url">X / Twitter 推文链接</label>
+    <div class="input-row">
+      <input type="url" id="url" name="url" required autocomplete="off" spellcheck="false" value="https://x.com/xsser_w/status/2109492334429962632">
+      <button id="submit" type="submit" disabled>生成图片</button>
+    </div>
+    <div class="mode">
+      <label for="mode">翻译模式</label>
+      <select id="mode" disabled>
+        <option value="pipeline">当前链路 · 主模型 10 次＋保底 3 次</option>
+        <option value="gemini">Gemini · 单次＋一次修正</option>
+        <option value="deepseek">DeepSeek · 单次＋一次修正</option>
+      </select>
+      <p id="mode-detail">正在读取模型配置…</p>
+    </div>
+    <div class="settings">
+      <label><input id="translate" type="checkbox" checked>翻译为简体中文</label>
+      <span id="model">正在连接测试服务…</span>
+    </div>
+    <p id="notice" role="alert" hidden></p>
+  </form>
+  <section id="progress" aria-live="polite" hidden>
+    <p id="status"></p><p id="detail"></p>
+    <div class="steps" aria-hidden="true">
+      <span data-step="fetching">抓取推文</span>
+      <span data-step="translating">翻译＋下载素材</span>
+      <span data-step="rendering">排版截图</span>
+      <span data-step="completed">完成</span>
+    </div>
+  </section>
+  <div id="results"></div>
+  <div id="data-links"></div>
+  <p class="foot">使用项目正式图片模板。图片较长时自动分片，可逐张下载 PNG。</p>
+</main>
+<script>
+  const form = document.querySelector('#form');
+  const submit = document.querySelector('#submit');
+  const notice = document.querySelector('#notice');
+  const resultBox = document.querySelector('#results');
+  const links = document.querySelector('#data-links');
+  const progress = document.querySelector('#progress');
+  const statusText = document.querySelector('#status');
+  const detailText = document.querySelector('#detail');
+  const translate = document.querySelector('#translate');
+  const mode = document.querySelector('#mode');
+  const statuses = {queued: '测试已排队', fetching: '正在抓取推文', translating: '正在翻译并下载素材', retry_wait: '翻译未通过，等待重试', downloading_assets: '正在下载素材', rendering: '正在排版截图', completed: '图片已生成', failed: '测试未完成'};
+  let active = '';
+  let submitted = false;
+  let configuration;
+  function updateMode() {
+    if (!configuration) return;
+    mode.disabled = !translate.checked || !configuration.translation_available;
+    const selected = configuration.modes.find(item => item.id === mode.value);
+    const models = selected.routes.map(route => route.model).join(' → ');
+    document.querySelector('#mode-detail').textContent = !translate.checked ? '输出原文图片，不请求模型。' :
+      !selected.available ? '所选模式尚未配置。' : models + (mode.value === 'pipeline' ? ' · 成功即停止；校验失败带上错误反馈重试，失败间隔 ' + configuration.retry_seconds + ' 秒，全部失败则输出原文。' : ' · 首次请求一次；校验失败立即修正一次，仍失败则显示原因。');
+    submit.disabled = submitted || (translate.checked && !selected.available);
+  }
+  mode.addEventListener('change', updateMode);
+  translate.addEventListener('change', updateMode);
+  function error(message) {notice.textContent = message; notice.hidden = false;}
+  async function jsonFetch(url, options) {
+    const response = await fetch(url, options);
+    const data = await response.json();
+    if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : '请求失败，请检查链接后再试。');
+    return data;
+  }
+  function translationFailure(details, code) {
+    const reasons = {empty_translation: '译文为空', no_chinese_text: '标为需要翻译，但译文不含汉字'};
+    const fields = {urls: 'URL', mentions: '@用户名', numbers: '数字'};
+    let reason = reasons[details.reason] || code;
+    if (details.reason === 'protected_content_changed') {
+      reason = (details.changed || []).map(name => fields[name] || name).join('、') || '受保护内容';
+      reason += '与原文不一致';
+      const numbers = details.number_changes;
+      if (numbers) {
+        const describe = counts => Object.entries(counts || {}).map(([value, count]) => value + '（' + count + '处）').join('、');
+        const missing = describe(numbers.missing), added = describe(numbers.added);
+        if (missing) reason += '；缺少原文数字 ' + missing;
+        if (added) reason += '；新增数字 ' + added;
+      }
+    }
+    return '帖子 ' + details.post_id + (details.poll_option ? '的投票选项 ' + details.poll_option : '') + '：' + reason;
+  }
+  function draw(job) {
+    progress.hidden = false;
+    statusText.textContent = job.status === 'translating' && job.feedback_applied ? '正在根据校验反馈修正翻译' : statuses[job.status] || job.status;
+    const translated = job.translation_status === 'not_needed' ? '正文无需翻译' : job.translation_status === 'disabled' ? '原文输出' : job.translation_status === 'original_only' ? '翻译线路全部失败，已输出原文' : '已翻译 ' + (job.translated_posts || 0) + ' 条正文';
+    const counts = job.routes ? job.routes.map(route => (job.mode === 'deepseek' ? 'DeepSeek' : job.mode === 'gemini' ? 'Gemini' : route.name === 'primary' ? '主模型' : '保底模型') + ' ' + (job[route.name + '_attempts'] || 0) + '/' + route.attempts).join(' · ') : '';
+    const wait = Math.max(0, Math.ceil((job.next_attempt_at || 0) - Date.now() / 1000));
+    const running = (job.model || '') + (counts ? ' · ' + counts : '');
+    const assetSeconds = job.asset_status === 'downloading' ? Math.max(0, Math.floor(Date.now() / 1000 - job.asset_started_at)) : job.asset_seconds;
+    const assets = job.asset_status === 'downloading' || job.asset_status === 'ready' ? '素材 ' + (job.asset_completed || 0) + '/' + (job.asset_total || 0) + ' · ' + (assetSeconds || 0) + ' 秒' + (job.asset_failed ? ' · ' + job.asset_failed + ' 项加载失败' : '') : '';
+    detailText.textContent = job.status === 'completed' ? translated + ' · 共 ' + job.images.length + ' 张图片' + (job.translate ? ' · ' + running : '') : job.status === 'retry_wait' ? running + ' · ' + wait + ' 秒后重试 · ' + job.last_translation_error : job.status === 'translating' ? running : job.status === 'failed' && job.translation_attempts ? running + ' · ' + job.url : job.url;
+    const rejected = job.last_translation_details || {};
+    if (rejected.post_id && ['retry_wait', 'failed', 'completed'].includes(job.status)) {
+      detailText.textContent += ' · 上次未通过的' + translationFailure(rejected, job.last_translation_error);
+    }
+    if (job.status === 'retry_wait' && job.files['translation-errors.json']) {
+      links.replaceChildren();
+      const diagnosis = document.createElement('a'); diagnosis.href = job.files['translation-errors.json']; diagnosis.target = '_blank'; diagnosis.rel = 'noopener'; diagnosis.textContent = '翻译失败记录'; links.append(diagnosis);
+    }
+    if (assets) detailText.textContent += ' · ' + assets;
+    if (job.source_started_at) {
+      const seconds = job.status === 'fetching' ? Math.max(0, Math.floor(Date.now() / 1000 - job.source_started_at)) : job.source_seconds;
+      detailText.textContent += ' · 抓取 ' + (seconds || 0) + ' 秒' + (job.source_attempts ? ' · 第 ' + job.source_attempts + (job.source_attempt_limit ? '/' + job.source_attempt_limit : '') + ' 次请求' : '');
+      if (job.status === 'fetching' && job.source_timeout_seconds) detailText.textContent += ' · 每次最多 ' + job.source_timeout_seconds + ' 秒';
+      if (job.status === 'fetching' && job.source_status === 'retry_wait') {
+        const retry = Math.max(0, Math.ceil((job.source_retry_at || 0) - Date.now() / 1000));
+        detailText.textContent += ' · ' + (job.source_last_error === 'source_timeout' ? '本次抓取超时' : '本次抓取失败') + '，' + retry + ' 秒后重试';
+      } else if (job.status === 'fetching' && job.source_status === 'requesting') {
+        detailText.textContent += ' · 等待 Nitter 返回详情';
+      }
+    }
+    if (job.render_seconds !== undefined) detailText.textContent += ' · 排版截图 ' + job.render_seconds + ' 秒';
+    const order = ['queued', 'fetching', 'translating', 'rendering', 'completed'];
+    const current = order.indexOf(['retry_wait', 'downloading_assets'].includes(job.status) ? 'translating' : job.status);
+    document.querySelectorAll('[data-step]').forEach(node => {
+      const index = order.indexOf(node.dataset.step);
+      node.classList.toggle('active', index === current);
+      node.classList.toggle('done', index < current || job.status === 'completed');
+    });
+    if (job.status === 'failed') {
+      const message = rejected.post_id && job.error.code === job.last_translation_error ?
+        (job.translation_attempts > 1 ? '修正后仍未通过：' : '单次翻译未通过：') + translationFailure(rejected, job.error.code) + '。可重新提交或选择原文输出。' : job.error.message;
+      error(message + ' [' + job.error.code + ']');
+      links.replaceChildren();
+      Object.entries(job.files).forEach(pair => {
+        if (pair[0].endsWith('.json')) {const a = document.createElement('a'); a.href = pair[1]; a.target = '_blank'; a.rel = 'noopener'; a.textContent = pair[0]; links.append(a);}
+      });
+    }
+    if (job.status !== 'completed') return;
+    resultBox.replaceChildren(); links.replaceChildren();
+    job.images.forEach((url, index) => {
+      const figure = document.createElement('figure'); figure.className = 'result';
+      const image = document.createElement('img'); image.src = url; image.alt = '推文图片第 ' + (index + 1) + ' 张';
+      const caption = document.createElement('figcaption');
+      const text = document.createElement('span'); text.textContent = '第 ' + (index + 1) + ' / ' + job.images.length + ' 张';
+      const download = document.createElement('a'); download.className = 'download'; download.href = url; download.download = 'tweet-' + (index + 1) + '.png'; download.textContent = '下载 PNG';
+      caption.append(text, download); figure.append(image, caption); resultBox.append(figure);
+    });
+    [['source.json', '原文数据'], ['llm-input.json', '上下文关系'], ['translated.json', '翻译结果'], ['translation-errors.json', '翻译失败记录']].forEach(pair => {
+      if (job.files[pair[0]]) {const a = document.createElement('a'); a.href = job.files[pair[0]]; a.target = '_blank'; a.rel = 'noopener'; a.textContent = pair[1]; links.append(a);}
+    });
+  }
+  async function watch(jobId) {
+    if (active !== jobId) return;
+    try {
+      const job = await jsonFetch('/api/previews/' + jobId);
+      draw(job);
+      if (job.status === 'completed' || job.status === 'failed') {submitted = false; updateMode(); return;}
+      setTimeout(() => watch(jobId), 1000);
+    } catch (e) {error(e.message); submitted = false; updateMode();}
+  }
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    if (submitted) return;
+    submitted = true; submit.disabled = true; notice.hidden = true; progress.hidden = true; resultBox.replaceChildren(); links.replaceChildren();
+    try {
+      const job = await jsonFetch('/api/previews', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url: document.querySelector('#url').value.trim(), translate: translate.checked, mode: mode.value})});
+      active = job.id; draw(job); history.replaceState(null, '', '/?job=' + active); await watch(active);
+    } catch (e) {error(e.message); submitted = false; updateMode();}
+  });
+  (async () => {
+    try {
+      const config = await jsonFetch('/api/config');
+      configuration = config;
+      translate.checked = config.translation_available; translate.disabled = !config.translation_available;
+      document.querySelector('#model').textContent = 'Prompt v' + config.prompt_version;
+      [...mode.options].forEach(option => {option.disabled = !config.modes.find(item => item.id === option.value).available;});
+      mode.value = config.modes.find(item => item.available)?.id || 'pipeline';
+      updateMode();
+      const job = new URLSearchParams(location.search).get('job');
+      if (job) {
+        const previous = await jsonFetch('/api/previews/' + job);
+        document.querySelector('#url').value = previous.url;
+        translate.checked = previous.translate && config.translation_available;
+        mode.value = previous.mode || 'pipeline'; updateMode();
+        active = job; submitted = true; submit.disabled = true; await watch(job);
+      }
+    } catch (e) {error('连接测试服务失败：' + e.message);}
+  })();
+</script>
+</body>
+</html>

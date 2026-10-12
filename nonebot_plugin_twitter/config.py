@@ -1,9 +1,15 @@
 import json
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, SecretStr
 from typing import Literal, Optional
 from typing_extensions import TypedDict
 from nonebot import get_driver, get_plugin_config
+
+
+class TranslationRouteConfig(BaseModel):
+    url: str
+    key: SecretStr
+    model: str
 
 
 class Config(BaseModel):
@@ -23,6 +29,15 @@ class Config(BaseModel):
     plugin_enabled: bool = True
     # 网页截图模式
     twitter_htmlmode: bool = False
+    # 独立启用正式图片模板；开启翻译时自动使用正式模板
+    twitter_template_enabled: bool = False
+    twitter_translation_enabled: bool = False
+    twitter_translation_primary: Optional[TranslationRouteConfig] = None
+    twitter_translation_fallback: Optional[TranslationRouteConfig] = None
+    twitter_translation_timeout: float = Field(default=60, gt=0, le=300)
+    twitter_translation_max_chars: int = Field(default=30000, ge=1000, le=200000)
+    twitter_render_width: int = Field(default=640, ge=320, le=1600)
+    twitter_render_max_height: int = Field(default=8000, ge=1000, le=16000)
     # 截取源地址网页
     twitter_original: bool = False
     # Nitter 截图时间显示时区

@@ -23,14 +23,10 @@ def get_recent_timeline_signatures(entries: list[dict], limit: int = TIMELINE_SE
 
 
 def get_new_timeline_entries(entries: list[dict], seen_signatures: list[str]) -> list[dict]:
-    if not entries or not seen_signatures:
+    if not entries:
         return []
 
-    current_signatures = {normalize_timeline_signature(entry["signature"]) for entry in entries}
     seen_signature_set = {normalize_timeline_signature(signature) for signature in seen_signatures}
-    if not current_signatures.intersection(seen_signature_set):
-        return []
-
     new_entries = []
     for entry in entries:
         if normalize_timeline_signature(entry["signature"]) in seen_signature_set:

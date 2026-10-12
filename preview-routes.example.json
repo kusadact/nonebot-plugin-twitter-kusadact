@@ -1,0 +1,12 @@
+{
+  "primary": {
+    "url": "https://your-gemini-service.example/v1",
+    "key": "YOUR_GEMINI_API_KEY",
+    "model": "gemini-3.8-flash"
+  },
+  "fallback": {
+    "url": "https://api.deepseek.com/v1",
+    "key": "YOUR_DEEPSEEK_API_KEY",
+    "model": "deepseek-flash"
+  }
+}
