@@ -31,6 +31,7 @@ from .timeline import get_new_timeline_entries, get_recent_timeline_signatures
 from .delivery import process_timeline
 from .pipeline import TweetPipeline
 from .translation import Translator
+from .manual_links import ManualLinkQueue
 
 
 __plugin_meta__ = PluginMetadata(
@@ -65,6 +66,7 @@ twitter_url_lock = asyncio.Lock()
 twitter_status_timeout_seconds = 180
 twitter_pipeline = None
 twitter_pipeline_task = None
+twitter_manual_queue = None
 
 
 def normalize_website_url(url: str) -> str:
@@ -204,7 +206,7 @@ if hasattr(get_driver, "server_app"):
 @get_driver.on_startup
 async def pywt_init():
     asyncio.create_task(ensure_twitter_url())
-    global twitter_pipeline, twitter_pipeline_task
+    global twitter_pipeline, twitter_pipeline_task, twitter_manual_queue
     if plugin_config.plugin_enabled:
         async def fetch_for_pipeline(user_name, tweet_id):
             if not await ensure_twitter_url():
@@ -212,6 +214,10 @@ async def pywt_init():
             return await fetch_tweet_view(user_name, tweet_id)
 
         renderer = make_tweet_renderer()
+        twitter_manual_queue = ManualLinkQueue(
+            Path("data/twitter/manual_links.json"),
+            prepare_delivery=prepare_tweet_delivery, send_part=send_manual_tweet_part,
+        )
         twitter_pipeline = TweetPipeline(
             read_state=read_twitter_list, update_state=update_twitter_list,
             fetch=fetch_for_pipeline, render=renderer.render,
@@ -222,6 +228,7 @@ async def pywt_init():
             prepare=prepare_tweet_delivery, deliver=tweet_handle, config=plugin_config,
             cache_dir=Path("data/twitter/cache/pipeline/tasks"),
             prepare_assets=renderer.prepare_assets,
+            manual_queue=twitter_manual_queue,
         )
         twitter_pipeline_task = asyncio.create_task(twitter_pipeline.run(), name="twitter-pipeline")
 
@@ -266,7 +273,10 @@ def clean_pic_cache():
     filenames = [f for f in os.listdir(path) if os.path.isfile(os.path.join(path,f))]
     timeline = int(datetime.now().timestamp()) - 60 * 60 * 5
     pinned = set()
-    for user in read_twitter_list().values():
+    pending = read_twitter_list()
+    if twitter_manual_queue is not None:
+        pending.update(twitter_manual_queue.read())
+    for user in pending.values():
         for entry in user.get("pending_tweets", []):
             delivery_cache = entry.get("processing", {}).get("delivery_cache")
             if delivery_cache:
@@ -500,17 +510,32 @@ async def twitter_status_handle(bot:Bot,event: MessageEvent,matcher: Matcher,arg
     except Exception as e:
         await matcher.finish(f"异常:{e}")
 
+async def send_manual_tweet_part(target, mode, segments):
+    bot = get_bots().get(target["bot_id"])
+    if bot is None:
+        raise ValueError("bot_disconnected")
+    message = deserialize_message(segments)
+    if mode == "node":
+        if target["kind"] == "group":
+            await bot.send_group_forward_msg(group_id=target["group_id"], messages=message)
+        else:
+            await bot.send_private_forward_msg(user_id=target["user_id"], messages=message)
+    else:
+        message = Message(MessageSegment.reply(target["message_id"])) + message
+        if target["kind"] == "group":
+            await bot.send_group_msg(group_id=target["group_id"], message=message)
+        else:
+            await bot.send_private_msg(user_id=target["user_id"], message=message)
+
+
 pat_twitter = on_regex(r'(twitter\.com|x\.com)/[a-zA-Z0-9_]+/status/\d+',priority=plugin_config.command_priority)
 @pat_twitter.handle()
 async def pat_twitter_handle(bot: Bot,event: MessageEvent,matcher: Matcher,text: str = RegexStr()):
     logger.info(f"检测到推文链接 {text}")
     link_list = read_link_list()
-    if not await ensure_twitter_url():
-        await matcher.finish("website 推文服务器访问失败，请检查连通性或代理")
     playwright = None
     browser = None
     try:
-        playwright,browser = await create_browser()
         if isinstance(event,GroupMessageEvent):
             # 是群，处理一下先
             if str(event.group_id) not in link_list:
@@ -530,6 +555,22 @@ async def pat_twitter_handle(bot: Bot,event: MessageEvent,matcher: Matcher,text:
         tmp = text.split("/")
         user_name = tmp[1]
         tweet_id = tmp[-1]
+
+        if plugin_config.twitter_translation_enabled:
+            if twitter_pipeline is None or twitter_manual_queue is None:
+                await matcher.finish("推文翻译服务尚未启动，请稍后重试。")
+            target = dict(bot_id=str(bot.self_id), user_id=int(event.user_id),
+                          message_id=int(event.message_id), kind="private")
+            if isinstance(event, GroupMessageEvent):
+                target.update(kind="group", group_id=int(event.group_id))
+            twitter_manual_queue.enqueue(source_user_name=user_name, tweet_id=tweet_id, target=target)
+            twitter_pipeline.wake.set()
+            await matcher.finish("推文已加入翻译队列，完成后会发送图片。", reply_message=True)
+
+        if not await ensure_twitter_url():
+            await matcher.finish("website 推文服务器访问失败，请检查连通性或代理")
+        if not use_tweet_template():
+            playwright,browser = await create_browser()
         
         tweet_info = await get_tweet(browser,user_name,tweet_id)
         msg = await tweet_handle_link(tweet_info,user_name,tweet_id)
@@ -547,7 +588,8 @@ async def pat_twitter_handle(bot: Bot,event: MessageEvent,matcher: Matcher,text:
     except FinishedException:
         pass            
     except Exception as e:
-        await matcher.send(f"异常:{e}")
+        logger.warning("手动推文处理失败：%s", type(e).__name__)
+        await matcher.send("推文处理失败，请稍后重试。")
     finally:
         await close_browser_resources(playwright, browser)
         await matcher.finish()

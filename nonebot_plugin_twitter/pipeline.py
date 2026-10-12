@@ -20,7 +20,7 @@ ROUTE_LIMITS = {"primary": 10, "fallback": 3}
 
 class TweetPipeline:
     def __init__(self, *, read_state, update_state, fetch, render, translator, prepare, deliver,
-                 config, cache_dir: Path, clock=time.time, prepare_assets=None):
+                 config, cache_dir: Path, clock=time.time, prepare_assets=None, manual_queue=None):
         self.read_state, self.update_state = read_state, update_state
         self.fetch, self.render, self.translator = fetch, render, translator
         self.prepare, self.deliver, self.config = prepare, deliver, config
@@ -31,13 +31,30 @@ class TweetPipeline:
         self.wake = asyncio.Event()
         self.prepare_assets = prepare_assets
         self.asset_tasks = {}
+        self.manual_queue = manual_queue
+
+    def is_manual(self, user):
+        return self.manual_queue is not None and self.manual_queue.owns(user)
+
+    def state_for(self, user):
+        return self.manual_queue.read() if self.is_manual(user) else self.read_state()
+
+    def update_for(self, user, mutator):
+        update = self.manual_queue.update if self.is_manual(user) else self.update_state
+        return update(mutator)
+
+    def all_state(self):
+        state = self.read_state()
+        if self.manual_queue is not None:
+            state.update(self.manual_queue.read())
+        return state
 
     def enabled(self):
         return bool(getattr(self.config, "twitter_template_enabled", False) or
                     getattr(self.config, "twitter_translation_enabled", False))
 
     def task(self, user, signature):
-        return next((entry for entry in self.read_state().get(user, {}).get("pending_tweets", [])
+        return next((entry for entry in self.state_for(user).get(user, {}).get("pending_tweets", [])
                      if entry["signature"] == signature), None)
 
     def save(self, user, entry, processing):
@@ -46,7 +63,7 @@ class TweetPipeline:
                 if item["signature"] == entry["signature"]:
                     item["processing"] = dict(processing)
                     break
-        self.update_state(update)
+        self.update_for(user, update)
 
     def write_view(self, user, entry, view):
         serialized = json.dumps(view.to_dict(), ensure_ascii=False, sort_keys=True)
@@ -92,7 +109,7 @@ class TweetPipeline:
                 except BlockingIOError:
                     return
                 try:
-                    snapshot = self.read_state()
+                    snapshot = self.all_state()
                     live_keys = {(user, entry["signature"]) for user, data in snapshot.items()
                                  for entry in data.get("pending_tweets", [])}
                     abandoned = [self.asset_tasks.pop(key) for key in list(self.asset_tasks) if key not in live_keys]
@@ -101,7 +118,7 @@ class TweetPipeline:
                     await asyncio.gather(*abandoned, return_exceptions=True)
                     for user, data in snapshot.items():
                         for entry in data.get("pending_tweets", []):
-                            if not self.enabled() and "processing" not in entry:
+                            if not self.enabled() and "processing" not in entry and not self.is_manual(user):
                                 continue
                             current = self.task(user, entry["signature"])
                             if current is None:
@@ -266,7 +283,8 @@ class TweetPipeline:
             info["rendered_images"] = state.get("images", [])
             if entry.get("is_retweet"):
                 info["text"] = [f"@{user} 转帖了 @{entry['source_user_name']}", *info["text"]]
-            prepared = await self.prepare(info, user, entry["tweet_id"], self.read_state())
+            prepare = self.manual_queue.prepare if self.is_manual(user) else self.prepare
+            prepared = await prepare(info, user, entry["tweet_id"], self.state_for(user))
             key = sha256(f"{user}:{entry['signature']}".encode()).hexdigest()
             path = self.cache_dir / f"{key}-delivery.json"
             tmp = path.with_suffix(".tmp")
@@ -277,9 +295,13 @@ class TweetPipeline:
             stage = "delivering"
         if stage == "delivering":
             info = json.loads(Path(state["delivery_cache"]).read_text("utf8"))
-            success = await self.deliver(info, user, entry["tweet_id"], self.read_state())
+            deliver = self.manual_queue.deliver if self.is_manual(user) else self.deliver
+            success = await deliver(info, user, entry["tweet_id"], self.state_for(user))
             if success:
-                self.update_state(lambda latest: acknowledge_tweet(latest, user, entry))
+                if self.is_manual(user):
+                    self.manual_queue.complete(user)
+                else:
+                    self.update_state(lambda latest: acknowledge_tweet(latest, user, entry))
             else:
                 state["next_attempt_at"] = self.clock() + RETRY_SECONDS
                 self.save(user, entry, state)
