@@ -611,35 +611,27 @@ async def twitter_link_handle(event: GroupMessageEvent,matcher: Matcher,arg: Mes
 twitter_timeline = on_command("推文列表",priority=plugin_config.command_priority)
 @twitter_timeline.handle()
 async def twitter_timeline_handle(bot: Bot,event: MessageEvent,matcher: Matcher,arg: Message = CommandArg()):
-    if not plugin_config.twitter_htmlmode:
-        await matcher.finish(f"暂时仅支持html模式，请先联系超级管理员开启")
-
-    if not await ensure_twitter_url():
-        await matcher.finish("website 推文服务器访问失败，请检查连通性或代理")
-    
-    await matcher.send(f"获取中, 请稍等一下..")
-    
-    user_info = await get_user_info(arg.extract_plain_text())
-    
-    if not user_info["status"]:
-        await matcher.finish(f"未找到 {arg.extract_plain_text()}")
-    new_line = await get_user_timeline(user_info["user_name"])
-    if "not found" in new_line:
-        await matcher.finish(f"未找到 {arg.extract_plain_text()} 存在推文时间线")
-    if len(new_line) > 5:
-        new_line = new_line[:5]
-    playwright = None
-    browser = None
+    user_name = arg.extract_plain_text().strip()
+    if not user_name:
+        await matcher.finish("用法：推文列表 <推主id>")
     try:
-        playwright,browser = await create_browser()
-        screen = await get_timeline_screen(browser,user_info["user_name"],len(new_line))
-        if not screen:
-            await matcher.finish("好像失败了...")
-        await matcher.send(MessageSegment.image(file=screen))
+        if not await ensure_twitter_url():
+            await matcher.finish("website 推文服务器访问失败，请检查连通性或代理")
+        await matcher.send("获取中, 请稍等一下..")
+        user_info = await get_user_info(user_name)
+        if not user_info["status"]:
+            await matcher.finish(f"未找到 {user_name}")
+        new_line = await get_user_timeline(user_info["user_name"])
+        if not new_line or "not found" in new_line:
+            await matcher.finish(f"未找到 {user_name} 的推文时间线")
+        images = await get_timeline_images(user_info["user_name"], new_line[:5])
+        if not images:
+            await matcher.finish("推文列表渲染失败，请稍后重试。")
+        for image in images:
+            await matcher.send(MessageSegment.image(file=image))
     except FinishedException:
-        pass            
+        raise
     except Exception as e:
-        await matcher.send(f"异常:{e}")
-    finally:
-        await close_browser_resources(playwright, browser)
-        await matcher.finish()
+        logger.warning("推文列表处理失败：%s", type(e).__name__)
+        await matcher.finish("推文列表处理失败，请稍后重试。")
+    await matcher.finish()

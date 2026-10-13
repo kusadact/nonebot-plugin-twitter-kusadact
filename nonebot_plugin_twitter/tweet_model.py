@@ -3,6 +3,20 @@
 from dataclasses import asdict, dataclass, field
 from hashlib import sha256
 import json
+import re
+
+
+def text_urls(text: str) -> list[str]:
+    """Retain complete HTTP URLs in body text, in their original order."""
+    urls = []
+    for match in re.finditer(r"https?://[^\s<>\"']+", text, flags=re.IGNORECASE):
+        url = match.group().rstrip(".,!?;:，。！？；：")
+        for opening, closing in (("(", ")"), ("[", "]"), ("{", "}")):
+            while url.endswith(closing) and url.count(closing) > url.count(opening):
+                url = url[:-1]
+        if url and url not in urls:
+            urls.append(url)
+    return urls
 
 
 @dataclass
@@ -180,18 +194,22 @@ class TweetView:
         return sha256(json.dumps(data, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
     def legacy_fields(self) -> dict:
-        # Replies belong in the rendered view; keep the existing main/quote media messages.
-        posts = list(self.main.walk())
-        images = list(dict.fromkeys(m.url for p in posts for m in p.media if m.kind == "image" and m.url))
-        videos = [m for p in posts for m in p.media if m.kind == "video" and m.url]
-        gifs = list(dict.fromkeys(m.url for p in self.walk() for m in p.media if m.kind == "gif" and m.url))
+        # Context media stays in the rendered view; attachments belong to the main post.
+        images = list(dict.fromkeys(m.url for m in self.main.media if m.kind == "image" and m.url))
+        videos = list(dict.fromkeys(m.url for m in self.main.media if m.kind == "video" and m.url))
+        gifs = list(dict.fromkeys(m.url for m in self.main.media if m.kind == "gif" and m.url))
+        urls = []
+        for part in self.main.parts:
+            candidates = [part.url or part.text] if part.kind == "url" else text_urls(part.text)
+            urls.extend(url for url in candidates if url.startswith(("http://", "https://")) and url not in urls)
         texts = [self.main.fallback_text] if self.main.fallback_text else []
         quote = self.main.quote
         if quote and quote.fallback_text:
             texts.append(f"引用 @{quote.author.username}：\n{quote.fallback_text}")
         return dict(status=True, html=b"", text=texts, pic_url_list=images,
-                    video_url=videos[0].url if videos else "", gif_url_list=gifs, r18=self.r18,
-                    media=any(p.media for p in posts),
+                    video_url=videos[0] if videos else "", video_url_list=videos,
+                    gif_url_list=gifs, url_list=urls, r18=self.r18,
+                    media=any(p.media for p in self.main.walk()),
                     quote_text=quote.text if quote else "",
                     quote_user_name=quote.author.username if quote else "",
                     view=self.to_dict())

@@ -31,7 +31,7 @@ from .config import (
 )
 from .nitter_parser import parse_nitter
 from .tweet_fetcher import fetch_nitter_view
-from .tweet_model import TweetView
+from .tweet_model import TweetView, text_urls
 from .renderer import TweetRenderer
 from .gif_media import convert_gif, gif_cache_path
 from .timeline import (
@@ -490,6 +490,23 @@ async def fetch_tweet_view(user_name: str, tweet_id: str) -> TweetView:
                                    proxy=plugin_config.twitter_proxy, headers=header)
 
 
+async def get_timeline_images(user_name: str, tweet_ids: list[str]) -> list[bytes]:
+    """Render up to five listed tweets, preserving tweet and image-slice order."""
+    selected = tweet_ids[:5]
+    if not selected:
+        return []
+    renderer = make_tweet_renderer()
+    images = []
+    # Listing remains read-only; do not enqueue subscription or translation work.
+    for tweet_id in selected:
+        view = await fetch_tweet_view(user_name, tweet_id)
+        paths = await renderer.render(view)
+        if not paths:
+            raise ValueError("timeline_render_empty")
+        images.extend(Path(path).read_bytes() for path in paths)
+    return images
+
+
 async def get_tweet(browser: Browser,user_name:str,tweet_id: str = "0") -> dict:
     '''通过 user_name 和 tweet_id 获取推文详情,
     return:
@@ -869,10 +886,14 @@ async def get_pic(url: str) -> MessageSegment:
 # 发送
 async def send_msg(
     twitter_list: dict, user_name: str, line_new_tweet_id: str, tweet_info: dict,
-    msg: Message, mode: Optional[Literal["node", "direct", "video"]] = "node", *, part: str = "main",
+    msg: Message, mode: Optional[Literal["node", "direct", "video"]] = "direct", *, part: str = "main",
+    requires_main: bool = False, legacy_receipts: list[str] | None = None,
+    receipt_aliases: list[str] | None = None,
 ) -> bool:
     if mode not in {"node", "direct", "video"}:
         raise ValueError(f"未知发送模式：{mode}")
+    if mode == "node":
+        msg = deserialize_message(unwrap_message_segments(serialize_message(msg)))
     success = True
     user = read_twitter_list().get(user_name, {})
     for kind in ("group", "private"):
@@ -885,18 +906,24 @@ async def send_msg(
                 continue
             target = f"{kind}:{recipient}"
             receipts = read_twitter_list().get(user_name, {}).get("pending_deliveries", {})
-            if part in receipts.get(str(line_new_tweet_id), {}).get(target, []):
+            completed = receipts.get(str(line_new_tweet_id), {}).get(target, [])
+            if part in completed or any(alias in completed for alias in receipt_aliases or []):
                 continue
+            if requires_main and "main" not in completed:
+                success = False
+                continue
+            target_msg = Message(segment for index, segment in enumerate(msg)
+                                 if not legacy_receipts or not legacy_receipts[index]
+                                 or legacy_receipts[index] not in completed)
             try:
-                if kind == "group":
-                    if mode == "node":
-                        sent = await tools.send_group_forward_msg_by_bots(group_id=int(recipient), node_msg=msg)
+                # Older frozen nodes are unwrapped before arriving here. All automatic
+                # deliveries use ordinary messages, including when twitter_node is set.
+                sent = True
+                if target_msg:
+                    if kind == "group":
+                        sent = await tools.send_group_msg_by_bots(group_id=int(recipient), msg=target_msg)
                     else:
-                        sent = await tools.send_group_msg_by_bots(group_id=int(recipient), msg=msg)
-                elif mode == "node":
-                    sent = await tools.send_private_forward_msg_by_bots(user_id=int(recipient), node_msg=msg)
-                else:
-                    sent = await tools.send_private_msg_by_bots(user_id=int(recipient), msg=msg)
+                        sent = await tools.send_private_msg_by_bots(user_id=int(recipient), msg=target_msg)
                 if not sent:
                     success = False
                     logger.warning(f"推文 {user_name}/status/{line_new_tweet_id} 未发送到 {target}")
@@ -1020,117 +1047,172 @@ async def prepare_manual_tweet_delivery(info: dict, user: str, tweet_id: str, st
     return await prepare_tweet_delivery(info, user, tweet_id, state, manual=True)
 
 
-async def prepare_tweet_delivery(info: dict, user: str, tweet_id: str, state: dict, *, manual=False) -> dict:
-    parts = []
-    nickname = state.get(user, {}).get("screen_name", user)
-    images = info.get("rendered_images", [])
-    for index, path in enumerate(images):
-        image = MessageSegment.image(Path(path).read_bytes())
-        if plugin_config.twitter_node and not manual:
-            message = Message(MessageSegment.node_custom(user_id=plugin_config.twitter_qq, nickname=nickname, content=Message(image)))
-            mode = "node"
-        else:
-            message, mode = Message(image), "reply" if manual else "direct"
-        parts.append(dict(part=f"image:{index}", mode=mode, message=serialize_message(message)))
-    if manual and not images and plugin_config.twitter_htmlmode and info.get("html"):
-        parts.append(dict(part="image:0", mode="reply", message=serialize_message(Message(MessageSegment.image(info["html"])))))
-    if not parts:
-        # Rendering exhausted its attempts: retain the existing original-content capability.
-        segments = [MessageSegment.text("\n\n".join(info.get("text", [])))] if info.get("text") else []
-        if not manual:
-            for url in info.get("pic_url_list", []):
-                segments.append(await get_pic(url))
-        if not segments and (manual or (not info.get("video_url") and not info.get("gif_url_list"))):
-            segments.append(MessageSegment.text(f"https://x.com/{user}/status/{tweet_id}"))
-        if segments:
-            parts.append(dict(part="original", mode="reply" if manual else "direct", message=serialize_message(Message(segments))))
-    if manual:
-        parts.extend(await prepare_manual_photos(info.get("pic_url_list", [])))
-    pinned_files = []
-    for index, url in enumerate(info.get("gif_url_list", [])):
-        path = await get_gif_path(url)
-        pinned_files.append(str(Path(path).resolve()))
-        gif = MessageSegment.image(Path(path).read_bytes())
-        parts.append(dict(part=f"gif:{index}", mode="direct", message=serialize_message(Message(gif))))
-    if info.get("video_url"):
-        files = await get_video_path(info["video_url"])
+def delivery_source_fields(info: dict) -> dict:
+    """Use the parsed main post even when old callers carry broader legacy lists."""
+    if info.get("view"):
+        source = TweetView.from_dict(info["view"]).legacy_fields()
+        return {name: source[name] for name in ("pic_url_list", "gif_url_list", "video_url_list", "url_list")}
+    text = info.get("text", [])
+    main_text = text[0] if text else ""
+    return dict(pic_url_list=list(dict.fromkeys(info.get("pic_url_list", []))),
+                gif_url_list=list(dict.fromkeys(info.get("gif_url_list", []))),
+                video_url_list=list(dict.fromkeys(info.get("video_url_list") or
+                                                 ([info["video_url"]] if info.get("video_url") else []))),
+                url_list=list(dict.fromkeys(info.get("url_list", text_urls(main_text)))))
+
+
+async def prepare_video_parts(urls: list[str], *, prefix="video", start=0) -> tuple[list[dict], list[str]]:
+    parts, pinned = [], []
+    for url in dict.fromkeys(urls):
+        files = await get_video_path(url)
         if not files:
             raise ValueError("video_download_empty")
-        for index, path in enumerate(files):
+        for path in files:
             video = await get_video(path)
             if video.type != "video":
                 raise ValueError("video_prepare_failed")
-            pinned_files.append(str(Path(path).resolve()))
-            parts.append(dict(part=f"video:{index}", mode="video", message=serialize_message(Message(video))))
+            pinned.append(str(Path(path).resolve()))
+            parts.append(dict(part=f"{prefix}:{start + len(parts)}", mode="video",
+                              message=serialize_message(Message(video))))
+    return parts, pinned
+
+
+async def prepare_tweet_delivery(info: dict, user: str, tweet_id: str, state: dict, *, manual=False) -> dict:
+    source = delivery_source_fields(info)
+    segments = [MessageSegment.image(Path(path).read_bytes()) for path in info.get("rendered_images", [])]
+    if not segments and plugin_config.twitter_htmlmode and info.get("html"):
+        segments.append(MessageSegment.image(info["html"]))
+    if not segments and info.get("text") and (manual or not plugin_config.twitter_no_text):
+        # Exhausted rendering still keeps the existing original-text fallback.
+        segments.append(MessageSegment.text("\n\n".join(info["text"])))
+    for url in source["pic_url_list"]:
+        segments.append(await get_pic(url))
+    pinned_files = []
+    for url in source["gif_url_list"]:
+        path = await get_gif_path(url)
+        pinned_files.append(str(Path(path).resolve()))
+        segments.append(MessageSegment.image(Path(path).read_bytes()))
+    if source["url_list"]:
+        segments.append(MessageSegment.text("\n" + "\n".join(source["url_list"])))
+    if not segments:
+        segments.append(MessageSegment.text(f"https://x.com/{user}/status/{tweet_id}"))
+    parts = [dict(part="main", mode="reply" if manual else "direct",
+                  message=serialize_message(Message(segments)))]
+    videos, video_files = await prepare_video_parts(source["video_url_list"])
+    parts.extend(videos)
+    pinned_files.extend(video_files)
     prepared = dict(status=True, r18=info.get("r18", False), media=info.get("media", False),
-                    html="", delivery_parts=parts, pinned_files=pinned_files)
+                    html="", delivery_version=2, delivery_parts=parts,
+                    pinned_files=list(dict.fromkeys(pinned_files)))
     if manual:
-        prepared["manual_delivery_version"] = 1
+        prepared["manual_delivery_version"] = 2
     return prepared
 
 
+def unwrap_message_segments(segments: list[dict]) -> list[dict]:
+    result = []
+    for segment in segments:
+        if segment["type"] == "node" and isinstance(segment["data"].get("content"), list):
+            result.extend(unwrap_message_segments(segment["data"]["content"]))
+        else:
+            result.append(segment)
+    return result
+
+
+async def upgrade_automatic_delivery(info: dict, user: str, tweet_id: str, state: dict) -> dict:
+    """Upgrade traceable frozen artifacts without repeating acknowledged segments."""
+    entry = next((item for item in state.get(user, {}).get("pending_tweets", [])
+                  if str(item["tweet_id"]) == str(tweet_id)), {})
+    processing = entry.get("processing", {})
+    try:
+        view = TweetView.from_dict(json.loads(Path(processing["view_cache"]).read_text("utf8")))
+    except (KeyError, OSError, ValueError):
+        # No source ownership can be recovered: retain old receipts and attachments,
+        # but unwrap frozen forward nodes so compatible retries send ordinary messages.
+        return dict(info, delivery_parts=[dict(part, mode="video" if part["part"].startswith("video:") else "direct",
+                                              message=unwrap_message_segments(part["message"]))
+                                          for part in info["delivery_parts"]])
+    fields = view.legacy_fields()
+    old_photos = list(dict.fromkeys(media.url for post in view.main.walk() for media in post.media
+                                   if media.kind == "image" and media.url))
+    old_gifs = list(dict.fromkeys(media.url for post in view.walk() for media in post.media
+                                 if media.kind == "gif" and media.url))
+    old_videos = [media.url for post in view.main.walk() for media in post.media
+                  if media.kind == "video" and media.url]
+    cached = {part["part"]: part for part in info["delivery_parts"]}
+    segments, legacy_receipts, photos = [], [], {}
+    def append(message, receipt=""):
+        plain = unwrap_message_segments(message)
+        segments.extend(plain)
+        legacy_receipts.extend([receipt] * len(plain))
+    for part in info["delivery_parts"]:
+        name = part["part"]
+        if name.startswith("image:"):
+            append(part["message"], name)
+        elif name == "original":
+            original = unwrap_message_segments(part["message"])
+            # The old text fallback had one initial text segment, followed by photos.
+            had_text = bool(fields["text"] or entry.get("is_retweet"))
+            offset = 1 if had_text and original and original[0]["type"] == "text" else 0
+            append(original[:offset], name)
+            photos.update(zip(old_photos, original[offset:]))
+    for url in fields["pic_url_list"]:
+        if url in photos:
+            append([photos[url]], "original")
+        else:
+            append(serialize_message(Message(await get_pic(url))))
+    pinned = list(info.get("pinned_files", []))
+    for url in fields["gif_url_list"]:
+        name = f"gif:{old_gifs.index(url)}"
+        if name in cached:
+            append(cached[name]["message"], name)
+        else:
+            path = await get_gif_path(url)
+            pinned.append(str(Path(path).resolve()))
+            append(serialize_message(Message(MessageSegment.image(Path(path).read_bytes()))))
+    if fields["url_list"]:
+        append(serialize_message(Message(MessageSegment.text("\n" + "\n".join(fields["url_list"])))),
+               "original" if "original" in cached else "")
+    # Distinct migrated IDs prevent an old quote-video receipt from suppressing a
+    # different main-post video. Matching frozen files keep their original aliases.
+    videos = []
+    first_video = old_videos[0] if old_videos else ""
+    if first_video in fields["video_url_list"]:
+        for part in info["delivery_parts"]:
+            if part["part"].startswith("video:"):
+                videos.append(dict(part=f"video:main:{len(videos)}", mode="video", message=part["message"],
+                                   receipt_aliases=[part["part"]]))
+    missing = [url for url in fields["video_url_list"] if url != first_video or not videos]
+    extra, video_files = await prepare_video_parts(missing, prefix="video:main", start=len(videos))
+    videos.extend(extra)
+    pinned.extend(video_files)
+    if not segments:
+        append(serialize_message(Message(MessageSegment.text(f"https://x.com/{user}/status/{tweet_id}"))))
+    migrated = dict(info, delivery_version=2, pinned_files=list(dict.fromkeys(pinned)),
+                    delivery_parts=[dict(part="main", mode="direct", message=segments,
+                                         legacy_receipts=legacy_receipts), *videos])
+    if processing.get("delivery_cache"):
+        _write_json_dict_atomic(Path(processing["delivery_cache"]), migrated)
+    return migrated
+
+
 async def tweet_handle(tweet_info: dict, user_name: str, line_new_tweet_id: str, twitter_list: dict) -> bool:
-    if "delivery_parts" in tweet_info or tweet_info.get("rendered_images") or tweet_info.get("gif_url_list"):
-        if "delivery_parts" not in tweet_info:
-            tweet_info = await prepare_tweet_delivery(tweet_info, user_name, line_new_tweet_id, twitter_list)
-        success = True
-        for part in tweet_info["delivery_parts"]:
-            success = await send_msg(twitter_list, user_name, line_new_tweet_id, tweet_info,
-                                     deserialize_message(part["message"]), part["mode"], part=part["part"]) and success
-        return success
-    if not tweet_info["status"]:
-        if not tweet_info["html"] or not plugin_config.twitter_htmlmode:
+    if "delivery_parts" not in tweet_info:
+        if not tweet_info.get("status") and not (tweet_info.get("html") and plugin_config.twitter_htmlmode):
             logger.warning(f"{user_name} 的推文 {line_new_tweet_id} 获取失败")
             return False
-        image = MessageSegment.image(tweet_info["html"])
-        if plugin_config.twitter_node:
-            msg = Message(MessageSegment.node_custom(
-                user_id=plugin_config.twitter_qq,
-                nickname=twitter_list[user_name]["screen_name"], content=Message(image),
-            ))
-            mode = "node"
-        else:
-            msg, mode = Message(image), "direct"
-        return await send_msg(twitter_list, user_name, line_new_tweet_id, tweet_info, msg, mode, part="fallback")
-
-    all_msg = await get_tweet_context(tweet_info, user_name, line_new_tweet_id)
-    has_text = bool(tweet_info["text"]) and not plugin_config.twitter_no_text and not tweet_info.get("rendered_images")
-    media_msgs, video_msgs = split_video_messages(all_msg)
-    prefer_nitter_first = should_send_nitter_first(tweet_info)
-    nitter_msgs, content_media_msgs = split_nitter_preview_messages(tweet_info, media_msgs)
-    parts = []
-    if plugin_config.twitter_node and not video_msgs:
-        text_msgs = [MessageSegment.text(text) for text in tweet_info["text"]] if has_text else []
-        ordered = (
-            [*nitter_msgs, *text_msgs, *content_media_msgs] if prefer_nitter_first else
-            [*text_msgs, *media_msgs]
-        )
-        if ordered:
-            nodes = [MessageSegment.node_custom(
-                user_id=plugin_config.twitter_qq,
-                nickname=twitter_list[user_name]["screen_name"], content=Message(segment),
-            ) for segment in ordered]
-            parts.append(("node", "node", Message(nodes)))
-    elif video_msgs or prefer_nitter_first:
-        if prefer_nitter_first and nitter_msgs:
-            parts.append(("preview", "direct", Message(nitter_msgs)))
-        if has_text:
-            parts.append(("text", "direct", Message(MessageSegment.text('\n\n'.join(tweet_info["text"])))))
-        media = content_media_msgs if prefer_nitter_first else media_msgs
-        if media:
-            parts.append(("media", "direct", Message(media)))
-        for index, video in enumerate(video_msgs):
-            parts.append((f"video:{index}", "video", Message(video)))
-    else:
-        if has_text:
-            media_msgs.insert(0, MessageSegment.text('\n\n'.join(tweet_info["text"])))
-        if media_msgs:
-            parts.append(("direct", "direct", Message(media_msgs)))
-
+        tweet_info = await prepare_tweet_delivery(tweet_info, user_name, line_new_tweet_id, twitter_list)
+    elif tweet_info.get("delivery_version", 0) < 2 and not any(part["part"] == "main" for part in tweet_info["delivery_parts"]):
+        tweet_info = await upgrade_automatic_delivery(tweet_info, user_name, line_new_tweet_id, twitter_list)
+    has_main = any(part["part"] == "main" for part in tweet_info["delivery_parts"])
     success = True
-    for part, mode, msg in parts:
+    for part in tweet_info["delivery_parts"]:
         success = await send_msg(
-            twitter_list, user_name, line_new_tweet_id, tweet_info, msg, mode, part=part,
+            twitter_list, user_name, line_new_tweet_id, tweet_info,
+            deserialize_message(unwrap_message_segments(part["message"])),
+            "video" if part["part"].startswith("video:") else "direct", part=part["part"],
+            requires_main=has_main and part["part"].startswith("video:"),
+            legacy_receipts=part.get("legacy_receipts"), receipt_aliases=part.get("receipt_aliases"),
         ) and success
     return success
 

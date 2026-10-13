@@ -72,7 +72,7 @@ def test_actual_quote_and_reply_media_remain_owned(modules):
     assert parsed.replies[1].text == ""
     assert len(parsed.replies[1].media) == 1
     assert parsed.legacy_fields()["video_url"] == ""
-    assert parsed.legacy_fields()["gif_url_list"] == [parsed.main.quote.media[0].url, parsed.replies[1].media[0].url]
+    assert parsed.legacy_fields()["gif_url_list"] == []
     assert parsed.main.quote.media[0].poster.startswith("http://nitter.test/")
     assert modules.tweet_model.TweetView.from_dict(parsed.to_dict()).to_dict() == parsed.to_dict()
     rendered = BeautifulSoup(modules.renderer.build_html(parsed), "html.parser")
@@ -658,8 +658,8 @@ async def test_gif_mp4_sends_looping_image_and_retries_frozen_attachment(plugin,
     info = dict(status=True, rendered_images=[str(image)], r18=False, media=True, text=[], pic_url_list=[], video_url="",
                 gif_url_list=["http://nitter.test/pic/video.twimg.com%2Ftweet_video%2Fa.mp4"])
     prepared = await plugin.api.prepare_tweet_delivery(info, "alice", "101", state)
-    assert [part["part"] for part in prepared["delivery_parts"]] == ["image:0", "gif:0"]
-    gif = prepared["delivery_parts"][-1]["message"][0]
+    assert [part["part"] for part in prepared["delivery_parts"]] == ["main"]
+    gif = prepared["delivery_parts"][0]["message"][-1]
     assert gif["type"] == "image"
     data = base64.b64decode(gif["data"]["file"].removeprefix("base64://"))
     assert data.startswith(b"GIF89a") and b"NETSCAPE2.0\x03\x01\x00\x00" in data
@@ -667,11 +667,11 @@ async def test_gif_mp4_sends_looping_image_and_retries_frozen_attachment(plugin,
                                      "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", prepared["pinned_files"][0]], text=True)
     assert int(frames.strip()) == 15
     async def send(*, group_id, msg):
-        return group_id == 1 or not msg[0].data["file"].startswith("base64://R0lG")
+        return group_id == 1 or not any(segment.data.get("file", "").startswith("base64://R0lG") for segment in msg)
     plugin.tools.send_group_msg_by_bots.side_effect = send
     assert not await plugin.api.tweet_handle(prepared, "alice", "101", state)
     receipts = plugin.api.read_twitter_list()["alice"]["pending_deliveries"]["101"]
-    assert receipts == {"group:1": ["image:0", "gif:0"], "group:2": ["image:0"]}
+    assert receipts == {"group:1": ["main"]}
     plugin.tools.send_group_msg_by_bots.reset_mock(side_effect=True)
     plugin.tools.send_group_msg_by_bots.return_value = True
     restored = json.loads(json.dumps(prepared))
@@ -883,23 +883,25 @@ async def test_rendered_images_and_video_only_retry_failed_parts(plugin, tmp_pat
     plugin.config.twitter_node = True
     info = dict(status=True, rendered_images=paths, r18=False, media=True, text=['text already in image'], pic_url_list=[], video_url='http://video.test/a.mp4')
     prepared = await plugin.api.prepare_tweet_delivery(info, 'alice', '101', state)
-    assert [part['part'] for part in prepared['delivery_parts']] == ['image:0', 'image:1', 'video:0']
-    assert [part['mode'] for part in prepared['delivery_parts']] == ['node', 'node', 'video']
+    assert [part['part'] for part in prepared['delivery_parts']] == ['main', 'video:0']
+    assert [part['mode'] for part in prepared['delivery_parts']] == ['direct', 'video']
+    assert [segment['type'] for segment in prepared['delivery_parts'][0]['message']] == ['image', 'image']
     async def send_group(*, group_id, msg):
-        return group_id == 1
+        return group_id == 1 or msg[0].type != 'video'
     plugin.tools.send_group_msg_by_bots.side_effect = send_group
     assert not await plugin.api.tweet_handle(prepared, 'alice', '101', state)
     receipts = plugin.api.read_twitter_list()['alice']['pending_deliveries']['101']
-    assert receipts['group:1'] == ['image:0', 'image:1', 'video:0']
-    assert receipts['group:2'] == ['image:0', 'image:1']
-    assert receipts['private:3'] == ['image:0', 'image:1', 'video:0']
+    assert receipts['group:1'] == ['main', 'video:0']
+    assert receipts['group:2'] == ['main']
+    assert receipts['private:3'] == ['main', 'video:0']
     plugin.tools.send_group_msg_by_bots.reset_mock(side_effect=True)
     plugin.tools.send_group_msg_by_bots.return_value = True
-    forward_calls = plugin.tools.send_group_forward_msg_by_bots.await_count
+    plugin.tools.send_group_forward_msg_by_bots.assert_not_called()
+    plugin.tools.send_private_forward_msg_by_bots.assert_not_called()
     assert await plugin.api.tweet_handle(prepared, 'alice', '101', state)
     calls = plugin.tools.send_group_msg_by_bots.await_args_list
     assert len(calls) == 1 and calls[0].kwargs['group_id'] == 2 and calls[0].kwargs['msg'][0].type == 'video'
-    assert plugin.tools.send_group_forward_msg_by_bots.await_count == forward_calls
+    plugin.tools.send_group_forward_msg_by_bots.assert_not_called()
     download.assert_awaited_once()
 
 

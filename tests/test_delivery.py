@@ -78,14 +78,15 @@ async def test_retry_only_failed_recipient(plugin):
 @pytest.mark.asyncio
 async def test_retry_only_failed_message_part(plugin, monkeypatch):
     setup_state(plugin)
-    monkeypatch.setattr(plugin.api, 'get_tweet_context', AsyncMock(return_value=[plugin.api.MessageSegment.video('test.mp4')]))
+    monkeypatch.setattr(plugin.api, 'get_video_path', AsyncMock(return_value=['test.mp4']))
+    monkeypatch.setattr(plugin.api, 'get_video', AsyncMock(return_value=plugin.api.MessageSegment.video('test.mp4')))
     async def send(*, group_id, msg):
         return msg[0].type != 'video'
     plugin.tools.send_group_msg_by_bots.side_effect = send
-    assert not await process(plugin, entries(101, 100), fetch=AsyncMock(return_value=tweet(media=True)))
+    assert not await process(plugin, entries(101, 100), fetch=AsyncMock(return_value=tweet(media=True, video_url='movie.mp4')))
     plugin.tools.send_group_msg_by_bots.reset_mock(side_effect=True)
     plugin.tools.send_group_msg_by_bots.return_value = True
-    assert await process(plugin, entries(101, 100), fetch=AsyncMock(return_value=tweet(media=True)))
+    assert await process(plugin, entries(101, 100), fetch=AsyncMock(return_value=tweet(media=True, video_url='movie.mp4')))
     calls = plugin.tools.send_group_msg_by_bots.await_args_list
     assert len(calls) == 1 and calls[0].kwargs['msg'][0].type == 'video'
 
@@ -98,7 +99,7 @@ async def test_cancelled_send_keeps_success_receipts_and_queue(plugin):
         await process(plugin, entries(101, 100))
     user = plugin.api.read_twitter_list()['alice']
     assert user['since_id'] == '100'
-    assert user['pending_deliveries']['101']['group:1'] == ['direct']
+    assert user['pending_deliveries']['101']['group:1'] == ['main']
     assert len(user['pending_tweets']) == 1
 
 

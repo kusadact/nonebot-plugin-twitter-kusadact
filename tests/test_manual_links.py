@@ -22,7 +22,7 @@ def make_worker(plugin, tmp_path, *, translator=None, now=None, state=None, queu
     view = model.TweetView(model.Post("101", model.Author("Alice", "alice"), [model.TextPart("Hello 2")]))
     state = state if state is not None else {}
     queue = queue or links.ManualLinkQueue(tmp_path / "manual.json", prepare_delivery=AsyncMock(
-        return_value=dict(delivery_parts=[dict(part="image:0", mode="direct", message=[dict(type="text", data=dict(text="translated"))])])),
+        return_value=dict(manual_delivery_version=2, delivery_parts=[dict(part="main", mode="reply", message=[dict(type="text", data=dict(text="translated"))])])),
         send_part=AsyncMock())
     config = SimpleNamespace(twitter_template_enabled=True, twitter_translation_enabled=True,
         twitter_translation_primary=dict(url="https://primary.test", key="fake-key", model="gemini-test"),
@@ -134,18 +134,20 @@ async def test_manual_asset_download_overlaps_translation(plugin, tmp_path):
 async def test_delivery_restart_skips_successful_parts_and_reuses_frozen_media(plugin, tmp_path):
     now = [0]
     worker, queue, translator, _ = make_worker(plugin, tmp_path, now=now)
-    queue.prepare_delivery.return_value = dict(delivery_parts=[
+    queue.prepare_delivery.return_value = dict(manual_delivery_version=2, delivery_parts=[
         dict(part=part, mode="direct", message=[dict(type="text", data=dict(text=part))])
-        for part in ("image:0", "gif:0", "video:0")])
+        for part in ("main", "video:0", "video:1")])
     queue.send_part.side_effect = [None, ValueError("failed")]
     key = enqueue(queue)
     await worker.tick()
-    assert queue.read()[key]["sent_parts"] == ["image:0"]
+    assert queue.read()[key]["sent_parts"] == ["main"]
+    assert [call.args[1] for call in queue.send_part.await_args_list] == ["reply", "video"]
     recovered = type(queue)(queue.path, prepare_delivery=queue.prepare_delivery, send_part=AsyncMock())
     fresh, _, _, _ = make_worker(plugin, tmp_path, queue=recovered, translator=translator, now=now)
     now[0] = 60
     await fresh.tick()
-    assert [call.args[2][0]["data"]["text"] for call in recovered.send_part.await_args_list] == ["gif:0", "video:0"]
+    assert [call.args[2][0]["data"]["text"] for call in recovered.send_part.await_args_list] == ["video:0", "video:1"]
+    assert all(call.args[1] == "video" for call in recovered.send_part.await_args_list)
     assert translator.translate.await_count == 1
     queue.prepare_delivery.assert_awaited_once()
     fresh.fetch.assert_not_awaited()
@@ -285,10 +287,12 @@ def test_daily_cleanup_preserves_media_pinned_by_manual_request(plugin, tmp_path
 
 
 @pytest.mark.asyncio
-async def test_manual_preview_and_original_media_are_separate_even_with_forwarding_enabled(plugin, tmp_path, monkeypatch):
+async def test_manual_reply_groups_previews_main_photos_gifs_and_urls_then_sends_main_videos(plugin, tmp_path, monkeypatch):
     plugin.config.twitter_node = True
     preview = tmp_path / "preview.png"
     preview.write_bytes(b"preview")
+    second = tmp_path / "second.png"
+    second.write_bytes(b"second")
     gif, video = tmp_path / "loop.gif", tmp_path / "clip.mp4"
     gif.write_bytes(b"GIF89a")
     video.write_bytes(b"mp4")
@@ -297,93 +301,192 @@ async def test_manual_preview_and_original_media_are_separate_even_with_forwardi
     monkeypatch.setattr(plugin.api, "get_gif_path", AsyncMock(return_value=str(gif)))
     monkeypatch.setattr(plugin.api, "get_video_path", AsyncMock(return_value=[str(video)]))
     monkeypatch.setattr(plugin.api, "get_video", AsyncMock(return_value=plugin.api.MessageSegment.video("clip.mp4")))
-    info = dict(status=True, text=["hello"], html=b"", rendered_images=[str(preview)],
-        pic_url_list=["main.jpg", "quote.jpg", "main.jpg"], gif_url_list=["gif.mp4"], video_url="video.mp4")
+    model = importlib.import_module(f"{plugin.api.__package__}.tweet_model")
+    view = model.TweetView(model.Post("101", parts=[model.TextPart("hello "),
+        model.TextPart("https://main.test", "url", "https://main.test")],
+        media=[model.Media("image", "main.jpg"), model.Media("gif", "gif.mp4"),
+               model.Media("video", "video.mp4"), model.Media("video", "second-video.mp4")],
+        quote=model.Post("102", parts=[model.TextPart("https://quote.test", "url", "https://quote.test")],
+                         media=[model.Media("image", "quote.jpg"), model.Media("gif", "quote-gif.mp4"), model.Media("video", "quote-video.mp4")])) ,
+        replies=[model.Post("103", media=[model.Media("image", "reply.jpg"),
+                 model.Media("gif", "reply-gif.mp4"), model.Media("video", "reply-video.mp4")])])
+    info = dict(view.legacy_fields(), rendered_images=[str(preview), str(second)])
     prepared = await plugin.api.prepare_manual_tweet_delivery(info, "alice", "101", {})
     assert [(part["part"], part["mode"]) for part in prepared["delivery_parts"]] == [
-        ("image:0", "reply"), ("photo:0", "direct"), ("photo:1", "direct"), ("gif:0", "direct"), ("video:0", "video")]
+        ("main", "reply"), ("video:0", "video"), ("video:1", "video")]
     assert all(part["message"][0]["type"] != "node" for part in prepared["delivery_parts"])
-    assert [call.args[0] for call in photo.await_args_list] == ["main.jpg", "quote.jpg"]
-    assert prepared["manual_delivery_version"] == 1
-    # Automatic subscription delivery retains the existing forwarding/media policy.
+    assert [call.args[0] for call in photo.await_args_list] == ["main.jpg"]
+    plugin.api.get_gif_path.assert_awaited_once_with("gif.mp4")
+    assert [call.args[0] for call in plugin.api.get_video_path.await_args_list] == ["video.mp4", "second-video.mp4"]
+    main = prepared["delivery_parts"][0]["message"]
+    assert [segment["type"] for segment in main] == ["image"] * 4 + ["text"]
+    assert [segment["data"]["file"] for segment in main[:4]] == [
+        plugin.api.MessageSegment.image(content).data["file"] for content in (b"preview", b"second", b"main.jpg", b"GIF89a")]
+    assert main[-1]["data"]["text"].strip() == "https://main.test"
+    assert prepared["manual_delivery_version"] == 2
+    # The shared packer differs only in whether its first message is a reply.
     automatic = await plugin.api.prepare_tweet_delivery(info, "alice", "101", {})
-    assert automatic["delivery_parts"][0]["mode"] == "node"
-    assert not any(part["part"].startswith("photo:") for part in automatic["delivery_parts"])
+    assert automatic["delivery_parts"][0]["mode"] == "direct"
+    assert [part["message"] for part in automatic["delivery_parts"]] == [part["message"] for part in prepared["delivery_parts"]]
 
 
 @pytest.mark.asyncio
-async def test_manual_render_failure_keeps_original_photos_separate(plugin, monkeypatch):
+async def test_manual_render_failure_groups_original_text_and_photos_in_one_reply(plugin, monkeypatch):
     monkeypatch.setattr(plugin.api, "get_pic", AsyncMock(return_value=plugin.api.MessageSegment.image(b"photo")))
     prepared = await plugin.api.prepare_manual_tweet_delivery(
         dict(status=True, text=["hello"], pic_url_list=["photo.jpg"]), "alice", "101", {})
-    assert [(part["part"], part["mode"]) for part in prepared["delivery_parts"]] == [("original", "reply"), ("photo:0", "direct")]
+    assert [(part["part"], part["mode"]) for part in prepared["delivery_parts"]] == [("main", "reply")]
     assert prepared["delivery_parts"][0]["message"][0]["type"] == "text"
-    assert prepared["delivery_parts"][1]["message"][0]["type"] == "image"
+    assert prepared["delivery_parts"][0]["message"][1]["type"] == "image"
 
 
 @pytest.mark.asyncio
-async def test_manual_legacy_html_preview_replies_and_also_sends_photos(plugin, monkeypatch):
+async def test_manual_legacy_html_preview_groups_photos_in_same_reply(plugin, monkeypatch):
     plugin.config.twitter_htmlmode = True
     plugin.config.twitter_node = True
     monkeypatch.setattr(plugin.api, "get_pic", AsyncMock(return_value=plugin.api.MessageSegment.image(b"photo")))
     prepared = await plugin.api.prepare_manual_tweet_delivery(
         dict(status=True, text=["hello"], html=b"screenshot", pic_url_list=["photo.jpg"]), "alice", "101", {})
-    assert [(part["part"], part["mode"]) for part in prepared["delivery_parts"]] == [("image:0", "reply"), ("photo:0", "direct")]
+    assert [(part["part"], part["mode"]) for part in prepared["delivery_parts"]] == [("main", "reply")]
+    assert [segment["type"] for segment in prepared["delivery_parts"][0]["message"]] == ["image", "image"]
 
 
 @pytest.mark.asyncio
-async def test_url_handler_without_translation_uses_same_direct_media_policy(plugin, tmp_path, monkeypatch):
+@pytest.mark.parametrize("kind", ["group", "private"])
+async def test_url_handler_without_translation_uses_same_grouped_reply_and_normal_video_policy(plugin, tmp_path, monkeypatch, kind):
     plugin.config.twitter_translation_enabled = False
     plugin.config.twitter_template_enabled = True
     plugin.config.twitter_node = True
     preview = tmp_path / "preview.png"
     preview.write_bytes(b"preview")
     monkeypatch.setattr(plugin.api, "get_pic", AsyncMock(return_value=plugin.api.MessageSegment.image(b"photo")))
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(plugin.api, "get_video_path", AsyncMock(return_value=[str(video)]))
+    monkeypatch.setattr(plugin.api, "get_video", AsyncMock(return_value=plugin.api.MessageSegment.video(str(video))))
     ns, group_type = handler_namespace(plugin)
-    ns["get_tweet"] = AsyncMock(return_value=dict(status=True, text=["hello"], rendered_images=[str(preview)], pic_url_list=["photo.jpg"]))
+    ns["get_tweet"] = AsyncMock(return_value=dict(status=True, text=["hello"], rendered_images=[str(preview)],
+        pic_url_list=["photo.jpg"], video_url="video.mp4", url_list=["https://main.test"]))
     ns["send_manual_tweet_part"] = AsyncMock()
-    event = group_type()
+    event = group_type() if kind == "group" else SimpleNamespace()
     event.group_id, event.user_id, event.message_id = 1, 2, 3
     with pytest.raises(FinishedException):
         await ns["pat_twitter_handle"](SimpleNamespace(self_id="99"), event,
             SimpleNamespace(finish=AsyncMock(side_effect=FinishedException()), send=AsyncMock()), "x.com/alice/status/101")
-    assert [call.args[1] for call in ns["send_manual_tweet_part"].await_args_list] == ["reply", "direct"]
-    assert all(call.args[0] == TARGET for call in ns["send_manual_tweet_part"].await_args_list)
+    assert [call.args[1] for call in ns["send_manual_tweet_part"].await_args_list] == ["reply", "video"]
+    expected = dict(TARGET, kind=kind)
+    if kind == "private":
+        expected.pop("group_id")
+    assert all(call.args[0] == expected for call in ns["send_manual_tweet_part"].await_args_list)
+    main = ns["send_manual_tweet_part"].await_args_list[0].args[2]
+    assert [segment["type"] for segment in main] == ["image", "image", "text"]
+    assert main[-1]["data"]["text"].strip() == "https://main.test"
     ns["create_browser"].assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_old_frozen_forward_preview_adds_only_missing_photos_and_keeps_receipts(plugin, tmp_path, monkeypatch):
+@pytest.mark.parametrize("kind", ["group", "private"])
+async def test_translated_link_queue_sends_grouped_reply_then_normal_main_video(plugin, tmp_path, monkeypatch, kind):
+    worker, queue, translator, view = make_worker(plugin, tmp_path)
+    model = importlib.import_module(f"{plugin.api.__package__}.tweet_model")
+    view.main.parts.append(model.TextPart(" https://main.test"))
+    view.main.media = [model.Media("image", "main.jpg"), model.Media("gif", "main-gif.mp4"),
+                       model.Media("video", "main-video.mp4")]
+    view.main.quote = model.Post("102", media=[model.Media("image", "quote.jpg"),
+        model.Media("gif", "quote-gif.mp4"), model.Media("video", "quote-video.mp4")])
+    preview, gif, video = tmp_path / "preview.png", tmp_path / "main.gif", tmp_path / "main.mp4"
+    preview.write_bytes(b"preview")
+    gif.write_bytes(b"GIF89a")
+    video.write_bytes(b"video")
+    worker.render.return_value = [str(preview)]
+    queue.prepare_delivery = AsyncMock(wraps=plugin.api.prepare_manual_tweet_delivery)
+    queue.prepare_photos = plugin.api.prepare_manual_photos
+    monkeypatch.setattr(plugin.api, "get_pic", AsyncMock(return_value=plugin.api.MessageSegment.image(b"main-photo")))
+    monkeypatch.setattr(plugin.api, "get_gif_path", AsyncMock(return_value=str(gif)))
+    monkeypatch.setattr(plugin.api, "get_video_path", AsyncMock(return_value=[str(video)]))
+    monkeypatch.setattr(plugin.api, "get_video", AsyncMock(return_value=plugin.api.MessageSegment.video("main.mp4")))
+    target = dict(TARGET, kind=kind)
+    if kind == "private":
+        target.pop("group_id")
+    queue.enqueue(source_user_name="alice", tweet_id="101", target=target)
+
+    await worker.tick()
+
+    translator.translate.assert_awaited_once()
+    assert [call.args[0] for call in queue.send_part.await_args_list] == [target, target]
+    assert [call.args[1] for call in queue.send_part.await_args_list] == ["reply", "video"]
+    message = queue.send_part.await_args_list[0].args[2]
+    assert [segment["type"] for segment in message] == ["image", "image", "image", "text"]
+    assert message[-1]["data"]["text"] == "\nhttps://main.test"
+    plugin.api.get_pic.assert_awaited_once_with("main.jpg")
+    plugin.api.get_gif_path.assert_awaited_once_with("main-gif.mp4")
+    plugin.api.get_video_path.assert_awaited_once_with("main-video.mp4")
+    assert not queue.read()
+    worker.deliver.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_old_frozen_delivery_groups_only_main_media_and_keeps_receipts_across_retries(plugin, tmp_path, monkeypatch):
     now = [0]
     worker, queue, translator, view = make_worker(plugin, tmp_path, now=now)
     model = importlib.import_module(f"{plugin.api.__package__}.tweet_model")
-    view.main.media = [model.Media("image", "main.jpg")]
-    view.main.quote = model.Post("102", media=[model.Media("image", "quote.jpg")])
+    view.main.parts.append(model.TextPart(" https://main.test https://main.test"))
+    view.main.media = [model.Media("image", "main.jpg"), model.Media("gif", "main-gif.mp4"),
+                       model.Media("video", "main-video.mp4"), model.Media("video", "second-video.mp4")]
+    view.main.quote = model.Post("102", media=[model.Media("image", "quote.jpg"),
+        model.Media("gif", "quote-gif.mp4"), model.Media("video", "quote-video.mp4")])
+    view.replies = [model.Post("103", media=[model.Media("image", "reply.jpg"),
+        model.Media("gif", "reply-gif.mp4"), model.Media("video", "reply-video.mp4")])]
     frozen_preview = plugin.api.Message(plugin.api.MessageSegment.node_custom(
         user_id=1, nickname="Alice", content=plugin.api.Message(plugin.api.MessageSegment.image(b"frozen"))))
     queue.prepare_delivery.return_value = dict(delivery_parts=[
         dict(part="image:0", mode="node", message=plugin.api.serialize_message(frozen_preview)),
+        dict(part="gif:0", mode="direct", message=plugin.api.serialize_message(plugin.api.Message(plugin.api.MessageSegment.image(b"main-gif")))),
+        dict(part="gif:1", mode="direct", message=plugin.api.serialize_message(plugin.api.Message(plugin.api.MessageSegment.image(b"quote-gif")))),
+        dict(part="gif:2", mode="direct", message=plugin.api.serialize_message(plugin.api.Message(plugin.api.MessageSegment.image(b"reply-gif")))),
         dict(part="video:0", mode="video", message=plugin.api.serialize_message(plugin.api.Message(plugin.api.MessageSegment.video("frozen.mp4"))))])
-    queue.send_part.side_effect = [None, ValueError("video_failed")]
+    queue.send_part.side_effect = [None, ValueError("gif_failed")]
     key = enqueue(queue)
     await worker.tick()
     assert queue.read()[key]["sent_parts"] == ["image:0"]
     photos = AsyncMock(side_effect=lambda url: plugin.api.MessageSegment.image(url.encode()))
     monkeypatch.setattr(plugin.api, "get_pic", photos)
-    recovered = type(queue)(queue.path, prepare_delivery=queue.prepare_delivery, send_part=AsyncMock(side_effect=[None, ValueError("photo_failed")]),
+    monkeypatch.setattr(plugin.api, "get_gif_path", AsyncMock())
+    video = tmp_path / "second.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(plugin.api, "get_video_path", AsyncMock(return_value=[str(video)]))
+    monkeypatch.setattr(plugin.api, "get_video", AsyncMock(return_value=plugin.api.MessageSegment.video("second.mp4")))
+    upgrade = AsyncMock(wraps=plugin.api.prepare_manual_tweet_delivery)
+    recovered = type(queue)(queue.path, prepare_delivery=upgrade, send_part=AsyncMock(side_effect=ValueError("main_failed")),
         prepare_photos=plugin.api.prepare_manual_photos)
     fresh, _, _, _ = make_worker(plugin, tmp_path, now=now, queue=recovered, translator=translator)
     now[0] = 60
     await fresh.tick()
-    assert recovered.read()[key]["sent_parts"] == ["image:0", "photo:0"]
-    assert [call.args[1] for call in recovered.send_part.await_args_list] == ["direct", "direct"]
+    assert recovered.read()[key]["sent_parts"] == ["image:0"]
+    recovered.send_part.assert_awaited_once()
+    assert recovered.send_part.await_args.args[1] == "reply"
+    main = recovered.send_part.await_args.args[2]
+    assert [segment["type"] for segment in main] == ["image", "image", "text"]
+    assert [segment["data"]["file"] for segment in main[:2]] == [
+        plugin.api.MessageSegment.image(content).data["file"] for content in (b"main.jpg", b"main-gif")]
+    assert main[-1]["data"]["text"] == "\nhttps://main.test"
     recovered.send_part.reset_mock(side_effect=True)
+    recovered.send_part.side_effect = [None, ValueError("video_failed")]
     now[0] = 120
     await fresh.tick()
-    assert [call.args[2][0]["type"] for call in recovered.send_part.await_args_list] == ["image", "video"]
-    assert all(call.args[1] == "direct" for call in recovered.send_part.await_args_list)
-    assert photos.await_count == 2 and translator.translate.await_count == 1
+    assert recovered.read()[key]["sent_parts"] == ["image:0", "main"]
+    assert [call.args[1] for call in recovered.send_part.await_args_list] == ["reply", "video"]
+    recovered.send_part.reset_mock(side_effect=True)
+    now[0] = 180
+    await fresh.tick()
+    assert [call.args[2][0]["data"]["file"] for call in recovered.send_part.await_args_list] == ["frozen.mp4", "second.mp4"]
+    assert all(call.args[1] == "video" for call in recovered.send_part.await_args_list)
+    photos.assert_awaited_once_with("main.jpg")
+    plugin.api.get_gif_path.assert_not_awaited()
+    plugin.api.get_video_path.assert_awaited_once_with("second-video.mp4")
+    assert translator.translate.await_count == 1
     queue.prepare_delivery.assert_awaited_once()
+    upgrade.assert_awaited_once()
     fresh.fetch.assert_not_awaited()
     fresh.render.assert_not_awaited()
     assert not recovered.read()
